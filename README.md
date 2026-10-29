@@ -62,7 +62,7 @@
 
 ```bash
 # 1. 克隆代码仓库
-git clone https://github.com/<your-username>/openremote.git
+git clone https://github.com/XCool-603/openremote.git
 cd openremote
 
 # 2. 安装前端依赖
@@ -79,44 +79,52 @@ npm run tauri build
 
 ---
 
-## 🐳 Docker 部署中继与信令服务器 (方案 B)
+## 🐳 Docker 一键部署中继与信令服务器 (方案 B)
 
-OpenRemote 包含一套开箱即用的轻量级中继与信令服务（位于 `server/` 目录），仅需一条 Docker 命令即可部署到任何轻量云服务器（VPS）上：
+OpenRemote 包含一套极致轻量的中继与信令服务（位于 `server/` 目录），仅需 **10MB 内存**，零外部数据库依赖，可部署在任何 1 核 512M 的轻量云服务器（腾讯云、阿里云、华为云、AWS 等）上。
 
-### 1. 使用 Docker Compose 一键启动
+### 🚀 方式一：Linux 云服务器单行一键安装（全自动）
 
-在服务器上创建 `docker-compose.yml`：
-
-```yaml
-version: '3.8'
-
-services:
-  openremote-relay:
-    image: node:20-alpine
-    container_name: openremote-relay
-    restart: unless-stopped
-    working_dir: /app
-    volumes:
-      - ./server:/app
-    command: node signaling.js
-    ports:
-      - "28844:28844/tcp" # HTTP 信令 API
-      - "28844:28844/udp" # STUN 端口探测
-      - "28845:28845/tcp" # TCP 穿透中继隧道
-    environment:
-      - PORT=28844
-      - RELAY_PORT=28845
-```
-
-执行启动：
+在你的 Linux VPS 终端上直接执行以下命令：
 ```bash
-docker compose up -d
+curl -fsSL https://raw.githubusercontent.com/XCool-603/openremote/main/server/deploy.sh | sudo bash
+```
+> **该命令会自动执行**：系统架构检测 -> 自动安装 Docker -> 配置开机自启 -> 放行防火墙端口 -> 启动容器 -> 打印公网配置信息。
+
+---
+
+### 🐳 方式二：已有 Docker 服务器单条命令启动
+
+无需克隆整个项目仓库，复制执行即可：
+```bash
+mkdir -p /opt/openremote-server && cd /opt/openremote-server
+curl -fsSL https://raw.githubusercontent.com/XCool-603/openremote/main/server/signaling.js -o signaling.js
+docker run -d \
+  --name openremote-relay \
+  --restart always \
+  -v /opt/openremote-server/signaling.js:/app/signaling.js \
+  -w /app \
+  -p 28844:28844/tcp \
+  -p 28844:28844/udp \
+  -p 28845:28845/tcp \
+  node:20-alpine node signaling.js
 ```
 
-### 2. 验证服务器运行
+---
 
-- 访问信令健康检查：`curl http://<你的服务器IP>:28844/health`
-- 查看当前在线设备列表：`curl http://<你的服务器IP>:28844/devices`
+### 🛡️ 云平台安全组开放规则（必做）
+
+部署完成后，请在腾讯云/阿里云/华为云等**云控制台安全组**添加入方向放行规则：
+- **`28844 / TCP`**：HTTP 信令 API 与 9 位设备代码心跳注册
+- **`28844 / UDP`**：STUN 协议公网端口反射与打洞
+- **`28845 / TCP`**：TCP 流量穿透中继隧道
+
+### 🔍 验证运行
+浏览器打开：`http://<你的服务器公网IP>:28844/api/status`
+看到 `{"status": "online", ...}` 即表示部署成功！
+
+### 📱 客户端配置
+在 OpenRemote 软件中点击左侧 **【设置】** -> 将 **信令服务器地址** 修改为 `http://<你的服务器公网IP>:28844` 并保存，即可享受无视内网限制的全球设备穿透连接！详细文档请参阅 [server/README.md](./server/README.md)。
 
 ---
 

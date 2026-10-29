@@ -146,8 +146,8 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // 4. Status
-  if (url.pathname === '/api/status' || url.pathname === '/') {
+  // 4. Status & Healthcheck
+  if (url.pathname === '/api/status' || url.pathname === '/health' || url.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(
       JSON.stringify({
@@ -158,6 +158,9 @@ const server = http.createServer((req, res) => {
         features: ['IPv6-Direct', 'STUN-Reflective', 'TCP-Relay-Tunnel'],
         timestamp: new Date().toISOString(),
       })
+    );
+    return;
+  }
     );
     return;
   }
