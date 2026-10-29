@@ -290,9 +290,39 @@ pub async fn connect_to_device(
         }
     }
 
-    let channel = connected_channel.ok_or_else(|| {
-        format!("连接所有候选网络地址均失败: {}", last_err)
-    })?;
+    let channel = match connected_channel {
+        Some(c) => c,
+        None => {
+            // Direct QUIC connection to all candidates failed.
+            // Automatic fallback to TCP Relay Tunnel via dxcool.cn:28845!
+            if crate::signaling::is_device_code(&address) {
+                let signal_url = {
+                    let config = state.config.lock().await;
+                    config.signal_server_url.clone()
+                };
+                let relay_addr = crate::signaling::parse_relay_address(&signal_url);
+                log::info!(
+                    "Direct connection failed. Falling back to TCP Relay tunnel at {} for device {}",
+                    relay_addr,
+                    address
+                );
+                match crate::signaling::join_relay_tunnel(&relay_addr, &address).await {
+                    Ok(tcp_stream) => {
+                        log::info!("Successfully established TCP Relay tunnel to {}", address);
+                        ConnectionChannel::new_tcp(tcp_stream)
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "直连与中继穿透均失败: 直连最后错误: {}, 中继错误: {}",
+                            last_err, e
+                        ));
+                    }
+                }
+            } else {
+                return Err(format!("连接所有候选网络地址均失败: {}", last_err));
+            }
+        }
+    };
 
     // Perform handshake
     let my_id = {

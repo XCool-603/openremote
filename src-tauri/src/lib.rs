@@ -246,15 +246,184 @@ pub fn run() {
         )
     };
 
+    let signal_url_clone = signal_url.clone();
+    let d_code_clone = d_code.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             let l_ip = crate::signaling::detect_best_local_ip();
             let v6 = crate::signaling::detect_public_ipv6();
             let _ = crate::signaling::register_to_signaling(
-                &signal_url, &d_id, &d_code, &d_name, &l_ip, l_port, v6,
+                &signal_url_clone, &d_id, &d_code_clone, &d_name, &l_ip, l_port, v6,
             )
             .await;
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+
+    // Background continuous TCP Relay listener on dxcool.cn:28845
+    let relay_channel = app_state.active_channel.clone();
+    let relay_is_sharing = Arc::clone(&app_state.is_sharing);
+    let relay_input_sim = app_state.input_simulator.clone();
+    let relay_transfer_receivers = app_state.transfer_receivers.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let relay_addr = crate::signaling::parse_relay_address(&signal_url);
+        loop {
+            log::info!("Connecting to TCP Relay server at {} to stand by for remote control...", relay_addr);
+
+            match crate::signaling::register_relay_tunnel(&relay_addr, &d_code).await {
+                Ok(tcp_stream) => {
+                    log::info!("Successfully registered as host on TCP Relay! Standing by for controller...");
+                    let channel = transport::ConnectionChannel::new_tcp(tcp_stream);
+
+                    match channel.recv().await {
+                        Ok(msg) => {
+                            log::info!("Controller connected via TCP Relay tunnel! Message: {:?}", msg);
+                            *relay_channel.lock().await = Some(channel.clone());
+
+                            let stream_channel = channel.clone();
+                            let is_sharing_stream = Arc::clone(&relay_is_sharing);
+                            is_sharing_stream.store(true, std::sync::atomic::Ordering::SeqCst);
+
+                            let capture_task = tokio::spawn(async move {
+                                let mut capturer = match capture::create_capturer() {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        log::error!("Failed to create capturer for relay: {}", e);
+                                        return;
+                                    }
+                                };
+                                let encoder = codec::FrameEncoder::new(70);
+
+                                while is_sharing_stream.load(std::sync::atomic::Ordering::SeqCst) {
+                                    let start = std::time::Instant::now();
+                                    if let Ok(frame) = capturer.capture_frame() {
+                                        if frame.is_dirty {
+                                            if let Ok(jpeg) = encoder.encode(frame.width, frame.height, &frame.data) {
+                                                let screen_msg = protocol::Message::ScreenFrame {
+                                                    data: jpeg,
+                                                    width: frame.width,
+                                                    height: frame.height,
+                                                    timestamp: chrono::Utc::now().timestamp_millis(),
+                                                };
+                                                if let Err(e) = stream_channel.send(&screen_msg).await {
+                                                    log::info!("Relay stream closed: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let elapsed = start.elapsed();
+                                    let target = std::time::Duration::from_millis(33);
+                                    if elapsed < target {
+                                        tokio::time::sleep(target - elapsed).await;
+                                    }
+                                }
+                            });
+
+                            let channel_rx = channel.clone();
+                            let input_sim_rx = relay_input_sim.lock().await.clone();
+                            let is_sharing_clone = Arc::clone(&relay_is_sharing);
+                            let transfer_receivers_rx = relay_transfer_receivers.clone();
+
+                            loop {
+                                match channel_rx.recv().await {
+                                    Ok(msg) => match msg {
+                                        protocol::Message::MouseEvent {
+                                            x,
+                                            y,
+                                            button,
+                                            action,
+                                            delta_x,
+                                            delta_y,
+                                        } => {
+                                            if let Some(ref sim) = input_sim_rx {
+                                                let _ = sim.handle_mouse_event(
+                                                    &protocol::MouseEvent {
+                                                        x,
+                                                        y,
+                                                        button,
+                                                        action,
+                                                        delta_x,
+                                                        delta_y,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        protocol::Message::KeyEvent { key, action } => {
+                                            if let Some(ref sim) = input_sim_rx {
+                                                let _ = sim.handle_key_event(
+                                                    &protocol::KeyEvent { key, action },
+                                                );
+                                            }
+                                        }
+                                        protocol::Message::TypeText { text } => {
+                                            if let Some(ref sim) = input_sim_rx {
+                                                let _ = sim.type_text(&text);
+                                            }
+                                        }
+                                        protocol::Message::ClipboardUpdate { content } => {
+                                            let _ =
+                                                clipboard::ClipboardMonitor::set_text(
+                                                    &content,
+                                                );
+                                        }
+                                        protocol::Message::FileTransferStart {
+                                            id,
+                                            filename,
+                                            total_bytes,
+                                            file_hash,
+                                        } => {
+                                            commands::handle_file_start(
+                                                id,
+                                                filename,
+                                                total_bytes,
+                                                file_hash,
+                                                transfer_receivers_rx.clone(),
+                                            )
+                                            .await;
+                                        }
+                                        protocol::Message::FileChunk {
+                                            id,
+                                            offset,
+                                            data,
+                                            is_last,
+                                        } => {
+                                            commands::handle_file_chunk(
+                                                id,
+                                                offset,
+                                                data,
+                                                is_last,
+                                                transfer_receivers_rx.clone(),
+                                            )
+                                            .await;
+                                        }
+                                        protocol::Message::Ping { timestamp } => {
+                                            let _ = channel_rx
+                                                .send(&protocol::Message::Pong { timestamp })
+                                                .await;
+                                        }
+                                        _ => {}
+                                    },
+                                    Err(e) => {
+                                        log::info!("Relay peer session ended: {}", e);
+                                        is_sharing_clone.store(false, std::sync::atomic::Ordering::SeqCst);
+                                        break;
+                                    }
+                                }
+                            }
+                            capture_task.abort();
+                        }
+                        Err(e) => {
+                            log::warn!("Relay standby socket disconnected: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to register on TCP Relay: {}. Retrying in 5s...", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
         }
     });
 

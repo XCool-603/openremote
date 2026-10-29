@@ -187,3 +187,64 @@ pub async fn lookup_peer_candidates(
         .unwrap_or("Device not found or offline");
     Err(anyhow!("{}", msg))
 }
+
+/// Parse relay host from signaling server URL (defaults to relay port 28845)
+pub fn parse_relay_address(signal_url: &str) -> String {
+    let cleaned = signal_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+
+    let host = cleaned.split(':').next().unwrap_or("dxcool.cn");
+    format!("{}:28845", host)
+}
+
+/// Connect to TCP Relay server and join a session by device code
+pub async fn join_relay_tunnel(relay_addr: &str, device_code: &str) -> Result<TcpStream> {
+    let clean = clean_code(device_code);
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
+        .await
+        .map_err(|_| anyhow!("Connection to relay server {} timed out", relay_addr))?
+        .map_err(|e| anyhow!("Failed connecting to relay {}: {}", relay_addr, e))?;
+
+    let cmd = format!("JOIN {}\n", clean);
+    stream.write_all(cmd.as_bytes()).await?;
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .map_err(|_| anyhow!("Relay handshake timed out"))?
+        .map_err(|e| anyhow!("Relay read error: {}", e))?;
+
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    if resp.contains("OK") {
+        Ok(stream)
+    } else {
+        Err(anyhow!("Relay server error: {}", resp.trim()))
+    }
+}
+
+/// Connect to TCP Relay server and register as host waiting for peer join
+pub async fn register_relay_tunnel(relay_addr: &str, device_code: &str) -> Result<TcpStream> {
+    let clean = clean_code(device_code);
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
+        .await
+        .map_err(|_| anyhow!("Connection to relay server {} timed out", relay_addr))?
+        .map_err(|e| anyhow!("Failed connecting to relay {}: {}", relay_addr, e))?;
+
+    let cmd = format!("REGISTER {}\n", clean);
+    stream.write_all(cmd.as_bytes()).await?;
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .map_err(|_| anyhow!("Relay host register timed out"))?
+        .map_err(|e| anyhow!("Relay read error: {}", e))?;
+
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    if resp.contains("OK") {
+        Ok(stream)
+    } else {
+        Err(anyhow!("Relay host registration failed: {}", resp.trim()))
+    }
+}
