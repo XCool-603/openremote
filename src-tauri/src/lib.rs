@@ -234,6 +234,30 @@ pub fn run() {
                 });
     }
 
+    // Background continuous heartbeat registration with signaling server
+    let (signal_url, d_id, d_code, d_name, l_port) = {
+        let cfg = app_state.config.blocking_lock();
+        (
+            cfg.signal_server_url.clone(),
+            cfg.device_id.clone(),
+            cfg.device_code.clone(),
+            cfg.device_name.clone(),
+            cfg.listen_port,
+        )
+    };
+
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let l_ip = crate::signaling::detect_best_local_ip();
+            let v6 = crate::signaling::detect_public_ipv6();
+            let _ = crate::signaling::register_to_signaling(
+                &signal_url, &d_id, &d_code, &d_name, &l_ip, l_port, v6,
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        }
+    });
+
     tauri::Builder::default()
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

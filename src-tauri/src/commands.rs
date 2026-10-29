@@ -116,9 +116,7 @@ impl AppState {
 #[tauri::command]
 pub async fn get_device_info(state: State<'_, AppState>) -> Result<DeviceInfo, String> {
     let config = state.config.lock().await;
-    let local_ip = local_ip_address::local_ip()
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_string());
+    let local_ip = crate::signaling::detect_best_local_ip();
 
     let public_ipv6 = crate::signaling::detect_public_ipv6();
 

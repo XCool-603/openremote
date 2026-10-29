@@ -77,8 +77,39 @@ async fn send_http_request(
     Ok(body_str.trim().to_string())
 }
 
-/// Kernel-level zero-traffic auto detection of default public IPv6 address
+/// Enumerate all network interfaces to find the true physical LAN IPv4 (excluding VPN/Proxy TUNs like 198.18.x.x)
+pub fn detect_best_local_ip() -> String {
+    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        for (_name, ip) in &interfaces {
+            if let std::net::IpAddr::V4(ipv4) = ip {
+                let s = ipv4.to_string();
+                if !ipv4.is_loopback() && !ipv4.is_link_local() && !s.starts_with("198.18.") && !s.starts_with("198.19.") {
+                    if s.starts_with("192.168.") || s.starts_with("10.") || s.starts_with("172.") {
+                        return s;
+                    }
+                }
+            }
+        }
+    }
+    local_ip_address::local_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+/// Enumerate all network interfaces to find the true global unicast IPv6 address (starting with 2 or 3, e.g. 2408:..., 2409:..., 240e:...)
 pub fn detect_public_ipv6() -> Option<String> {
+    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        for (_name, ip) in interfaces {
+            if let std::net::IpAddr::V6(ipv6) = ip {
+                let s = ipv6.to_string();
+                if (s.starts_with('2') || s.starts_with('3')) && !s.starts_with("fe80") && !s.starts_with("fd") {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    // Fallback: UDP connect probe
     for target in &["[2400:3200::1]:53", "[2001:4860:4860::8888]:53"] {
         if let Ok(socket) = std::net::UdpSocket::bind("[::]:0") {
             if socket.connect(target).is_ok() {
