@@ -202,49 +202,31 @@ pub fn parse_relay_address(signal_url: &str) -> String {
 /// Connect to TCP Relay server and join a session by device code
 pub async fn join_relay_tunnel(relay_addr: &str, device_code: &str) -> Result<TcpStream> {
     let clean = clean_code(device_code);
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
+    let mut stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(relay_addr))
         .await
-        .map_err(|_| anyhow!("Connection to relay server {} timed out", relay_addr))?
-        .map_err(|e| anyhow!("Failed connecting to relay {}: {}", relay_addr, e))?;
+        .map_err(|_| anyhow!("连接中继服务器 {} 超时", relay_addr))?
+        .map_err(|e| anyhow!("无法连接中继服务器 {}: {}", relay_addr, e))?;
 
-    let cmd = format!("JOIN {}\n", clean);
+    // Protocol: "OPRM_RELAY <sessionId> CTRL\n"
+    let cmd = format!("OPRM_RELAY {} CTRL\n", clean);
     stream.write_all(cmd.as_bytes()).await?;
+    stream.flush().await?;
 
-    let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-        .await
-        .map_err(|_| anyhow!("Relay handshake timed out"))?
-        .map_err(|e| anyhow!("Relay read error: {}", e))?;
-
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    if resp.contains("OK") {
-        Ok(stream)
-    } else {
-        Err(anyhow!("Relay server error: {}", resp.trim()))
-    }
+    Ok(stream)
 }
 
 /// Connect to TCP Relay server and register as host waiting for peer join
 pub async fn register_relay_tunnel(relay_addr: &str, device_code: &str) -> Result<TcpStream> {
     let clean = clean_code(device_code);
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(relay_addr))
+    let mut stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(relay_addr))
         .await
-        .map_err(|_| anyhow!("Connection to relay server {} timed out", relay_addr))?
-        .map_err(|e| anyhow!("Failed connecting to relay {}: {}", relay_addr, e))?;
+        .map_err(|_| anyhow!("连接中继服务器 {} 超时", relay_addr))?
+        .map_err(|e| anyhow!("无法连接中继服务器 {}: {}", relay_addr, e))?;
 
-    let cmd = format!("REGISTER {}\n", clean);
+    // Protocol: "OPRM_RELAY <sessionId> HOST\n"
+    let cmd = format!("OPRM_RELAY {} HOST\n", clean);
     stream.write_all(cmd.as_bytes()).await?;
+    stream.flush().await?;
 
-    let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-        .await
-        .map_err(|_| anyhow!("Relay host register timed out"))?
-        .map_err(|e| anyhow!("Relay read error: {}", e))?;
-
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    if resp.contains("OK") {
-        Ok(stream)
-    } else {
-        Err(anyhow!("Relay host registration failed: {}", resp.trim()))
-    }
+    Ok(stream)
 }

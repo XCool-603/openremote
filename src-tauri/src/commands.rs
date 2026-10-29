@@ -277,15 +277,20 @@ pub async fn connect_to_device(
             }
         };
 
-        match client.connect(target_addr).await {
-            Ok(chan) => {
+        let connect_fut = client.connect(target_addr);
+        match tokio::time::timeout(std::time::Duration::from_millis(1200), connect_fut).await {
+            Ok(Ok(chan)) => {
                 log::info!("Successfully connected to candidate {}", target_addr);
                 connected_channel = Some(chan);
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log::warn!("Failed connecting to candidate {}: {}", target_addr, e);
                 last_err = e.to_string();
+            }
+            Err(_) => {
+                log::warn!("Connection to candidate {} timed out after 1.2s", target_addr);
+                last_err = format!("连接候选地址 {} 超时", target_addr);
             }
         }
     }
