@@ -1,0 +1,18 @@
+services:
+  openremote-relay:
+    build: .
+    container_name: openremote-relay
+    restart: unless-stopped
+    ports:
+      - "28844:28844/tcp"   # HTTP 信令与设备注册
+      - "28844:28844/udp"   # STUN NAT 端口反射
+      - "28845:28845/tcp"   # TCP 数据中继隧道
+    environment:
+      - PORT=28844
+      - UDP_PORT=28844
+      - RELAY_PORT=28845
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:28844/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
