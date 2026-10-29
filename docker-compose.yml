@@ -1,0 +1,15 @@
+services:
+  openremote-relay:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: openremote-relay
+    restart: always
+    ports:
+      - "28844:28844/tcp"   # HTTP 信令与设备查找
+      - "28844:28844/udp"   # STUN 端口探测打洞
+      - "28845:28845/tcp"   # TCP 数据穿透中继隧道
+    environment:
+      - PORT=28844
+      - UDP_PORT=28844
+      - RELAY_PORT=28845

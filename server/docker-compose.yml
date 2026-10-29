@@ -2,7 +2,7 @@ services:
   openremote-relay:
     build: .
     container_name: openremote-relay
-    restart: unless-stopped
+    restart: always
     ports:
       - "28844:28844/tcp"   # HTTP 信令与设备注册
       - "28844:28844/udp"   # STUN NAT 端口反射
