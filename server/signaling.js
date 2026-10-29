@@ -19,6 +19,16 @@ function normalizeCode(code) {
   return String(code || '').replace(/[-\s]/g, '').trim();
 }
 
+// Helper to send standard JSON response with Content-Length to avoid chunked transfer
+function sendJson(res, statusCode, data) {
+  const payload = JSON.stringify(data);
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
 // Prune stale device registrations every 30 seconds (TTL: 90s)
 setInterval(() => {
   const now = Date.now();
@@ -79,11 +89,9 @@ const server = http.createServer((req, res) => {
         peerRegistry.set(code, peerInfo);
         console.log(`[Signaling] Registered device ${data.device_code} (${peerInfo.deviceName}) IPv4: ${clientIp}, IPv6: ${peerInfo.ipv6 || 'none'}`);
 
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: true, publicIp: clientIp, registered: peerInfo }));
+        sendJson(res, 200, { success: true, publicIp: clientIp, registered: peerInfo });
       } catch (err) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Invalid JSON payload' }));
+        sendJson(res, 400, { error: 'Invalid JSON payload' });
       }
     });
     return;
@@ -106,27 +114,23 @@ const server = http.createServer((req, res) => {
       // Public IPv4 NAT reflexive address
       candidates.push(`${peer.publicIp}:${peer.publicPort}`);
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          found: true,
-          peer: {
-            deviceId: peer.deviceId,
-            deviceCode: peer.deviceCode,
-            deviceName: peer.deviceName,
-            localIp: peer.localIp,
-            listenPort: peer.listenPort,
-            publicIp: peer.publicIp,
-            publicPort: peer.publicPort,
-            ipv6: peer.ipv6,
-            relayPort: RELAY_PORT,
-            candidates,
-          },
-        })
-      );
+      sendJson(res, 200, {
+        found: true,
+        peer: {
+          deviceId: peer.deviceId,
+          deviceCode: peer.deviceCode,
+          deviceName: peer.deviceName,
+          localIp: peer.localIp,
+          listenPort: peer.listenPort,
+          publicIp: peer.publicIp,
+          publicPort: peer.publicPort,
+          ipv6: peer.ipv6,
+          relayPort: RELAY_PORT,
+          candidates,
+        },
+      });
     } else {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ found: false, message: `Device '${rawCode}' is offline or not found` }));
+      sendJson(res, 404, { found: false, message: `Device '${rawCode}' is offline or not found` });
     }
     return;
   }
@@ -136,34 +140,29 @@ const server = http.createServer((req, res) => {
     const sessionId = `relay_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     relaySessions.set(sessionId, { host: null, ctrl: null, createdAt: Date.now() });
 
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    sendJson(res, 200, {
       success: true,
       sessionId,
       relayHost: req.headers.host ? req.headers.host.split(':')[0] : '127.0.0.1',
       relayPort: RELAY_PORT,
-    }));
+    });
     return;
   }
 
   // 4. Status & Healthcheck
   if (url.pathname === '/api/status' || url.pathname === '/health' || url.pathname === '/') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        status: 'online',
-        server: 'OpenRemote Dual-Stack Signaling & Relay Server',
-        onlinePeers: peerRegistry.size,
-        activeRelays: relaySessions.size,
-        features: ['IPv6-Direct', 'STUN-Reflective', 'TCP-Relay-Tunnel'],
-        timestamp: new Date().toISOString(),
-      })
-    );
+    sendJson(res, 200, {
+      status: 'online',
+      server: 'OpenRemote Dual-Stack Signaling & Relay Server',
+      onlinePeers: peerRegistry.size,
+      activeRelays: relaySessions.size,
+      features: ['IPv6-Direct', 'STUN-Reflective', 'TCP-Relay-Tunnel'],
+      timestamp: new Date().toISOString(),
+    });
     return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Endpoint not found' }));
+  sendJson(res, 404, { error: 'Endpoint not found' });
 });
 
 // --- TCP Relay Tunneling Server (100% Connectivity Fallback) ---

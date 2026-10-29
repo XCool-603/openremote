@@ -44,7 +44,7 @@ impl Default for AppConfig {
             access_password: generate_random_password(),
             device_name: hostname,
             listen_port: 28843,
-            signal_server_url: "http://127.0.0.1:28844".to_string(),
+            signal_server_url: "http://dxcool.cn:28844".to_string(),
             auth_token: None,
         }
     }

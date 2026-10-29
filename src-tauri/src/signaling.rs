@@ -61,11 +61,20 @@ async fn send_http_request(
     .await;
 
     let response_str = String::from_utf8_lossy(&response_bytes);
-    if let Some(pos) = response_str.find("\r\n\r\n") {
-        Ok(response_str[pos + 4..].to_string())
+    let body_str = if let Some(pos) = response_str.find("\r\n\r\n") {
+        &response_str[pos + 4..]
     } else {
-        Ok(response_str.to_string())
+        &response_str
+    };
+
+    // Robust JSON extraction: strip HTTP Chunked transfer encoding or proxy noise
+    if let (Some(start), Some(end)) = (body_str.find('{'), body_str.rfind('}')) {
+        if start <= end {
+            return Ok(body_str[start..=end].to_string());
+        }
     }
+
+    Ok(body_str.trim().to_string())
 }
 
 /// Kernel-level zero-traffic auto detection of default public IPv6 address
