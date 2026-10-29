@@ -179,15 +179,27 @@ const relayServer = net.createServer((socket) => {
       const line = headerBuffer.slice(0, newlineIndex).trim();
       const remainder = chunk.slice(Buffer.byteLength(line, 'utf8') + 1);
 
-      // Protocol: "OPRM_RELAY <sessionId> <HOST|CTRL>"
+      // Protocol: "OPRM_RELAY <sessionId> <HOST|CTRL>" OR "REGISTER <sessionId>" OR "JOIN <sessionId>"
+      let sessionId = '';
+      let role = '';
+
       const parts = line.split(' ');
-      if (parts[0] !== 'OPRM_RELAY' || parts.length < 3) {
+      if (parts[0] === 'OPRM_RELAY' && parts.length >= 3) {
+        sessionId = parts[1];
+        role = parts[2].toUpperCase();
+      } else if (parts[0] === 'REGISTER' && parts.length >= 2) {
+        sessionId = parts[1];
+        role = 'HOST';
+      } else if (parts[0] === 'JOIN' && parts.length >= 2) {
+        sessionId = parts[1];
+        role = 'CTRL';
+      } else {
+        socket.write('ERROR Invalid handshake\n');
         socket.destroy();
         return;
       }
 
-      const sessionId = parts[1];
-      const role = parts[2].toUpperCase();
+      socket.write('OK\n');
       let session = relaySessions.get(sessionId);
 
       if (!session) {
