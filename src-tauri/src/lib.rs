@@ -17,6 +17,79 @@ use std::sync::Arc;
 use tauri::Manager;
 use transport::QuicServer;
 
+fn spawn_screen_stream_task(
+    stream_channel: transport::ConnectionChannel,
+    is_sharing_stream: Arc<std::sync::atomic::AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        log::info!("Starting screen streaming pipeline...");
+
+        while is_sharing_stream.load(std::sync::atomic::Ordering::SeqCst) {
+            let capturer_res = capture::create_capturer();
+            let mut capturer = match capturer_res {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Screen capturer standby (temporary desktop unavailable: {}). Sending keepalive frame...", e);
+                    let (w, h) = (1280u32, 720u32);
+                    let standby_rgb = vec![32u8; (w * h * 3) as usize];
+                    let encoder = codec::FrameEncoder::new(50);
+                    if let Ok(jpeg) = encoder.encode(w, h, &standby_rgb) {
+                        let msg = protocol::Message::ScreenFrame {
+                            data: jpeg,
+                            width: w,
+                            height: h,
+                            timestamp: chrono::Utc::now().timestamp_millis(),
+                        };
+                        if let Err(err) = stream_channel.send(&msg).await {
+                            log::info!("Channel closed during keepalive: {}", err);
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+
+            log::info!("Screen capturer successfully initialized! Pushing 30FPS stream...");
+            let encoder = codec::FrameEncoder::new(70);
+
+            while is_sharing_stream.load(std::sync::atomic::Ordering::SeqCst) {
+                let start = std::time::Instant::now();
+                match capturer.capture_frame() {
+                    Ok(frame) => {
+                        if frame.is_dirty {
+                            if let Ok(jpeg) = encoder.encode(frame.width, frame.height, &frame.data) {
+                                let msg = protocol::Message::ScreenFrame {
+                                    data: jpeg,
+                                    width: frame.width,
+                                    height: frame.height,
+                                    timestamp: chrono::Utc::now().timestamp_millis(),
+                                };
+                                if let Err(e) = stream_channel.send(&msg).await {
+                                    log::info!("Stream channel closed: {}", e);
+                                    is_sharing_stream.store(false, std::sync::atomic::Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Frame capture failed ({}), retrying capturer in 100ms...", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        break;
+                    }
+                }
+
+                let elapsed = start.elapsed();
+                let target = std::time::Duration::from_millis(33);
+                if elapsed < target {
+                    tokio::time::sleep(target - elapsed).await;
+                }
+            }
+        }
+    })
+}
+
 pub fn run() {
     let _ = env_logger::try_init();
 
@@ -91,45 +164,10 @@ pub fn run() {
                                 log::info!("Accepted incoming remote desktop connection");
                                 *state_channel.lock().await = Some(channel.clone());
 
-                                let stream_channel = channel.clone();
                                 let is_sharing_stream = Arc::clone(&is_sharing);
                                 is_sharing_stream.store(true, std::sync::atomic::Ordering::SeqCst);
 
-                                tokio::spawn(async move {
-                                    let mut capturer = match capture::create_capturer() {
-                                        Ok(c) => c,
-                                        Err(e) => {
-                                            log::error!("Failed to create capturer for connection: {}", e);
-                                            return;
-                                        }
-                                    };
-                                    let encoder = codec::FrameEncoder::new(70);
-
-                                    while is_sharing_stream.load(std::sync::atomic::Ordering::SeqCst) {
-                                        let start = std::time::Instant::now();
-                                        if let Ok(frame) = capturer.capture_frame() {
-                                            if frame.is_dirty {
-                                                if let Ok(jpeg) = encoder.encode(frame.width, frame.height, &frame.data) {
-                                                    let msg = protocol::Message::ScreenFrame {
-                                                        data: jpeg,
-                                                        width: frame.width,
-                                                        height: frame.height,
-                                                        timestamp: chrono::Utc::now().timestamp_millis(),
-                                                    };
-                                                    if let Err(e) = stream_channel.send(&msg).await {
-                                                        log::info!("Stream channel closed: {}", e);
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let elapsed = start.elapsed();
-                                        let target = std::time::Duration::from_millis(33);
-                                        if elapsed < target {
-                                            tokio::time::sleep(target - elapsed).await;
-                                        }
-                                    }
-                                });
+                                let _capture_task = spawn_screen_stream_task(channel.clone(), is_sharing_stream);
 
                                 let channel_rx = channel.clone();
                                 let input_sim_rx = input_sim.lock().await.clone();
@@ -281,45 +319,10 @@ pub fn run() {
                             log::info!("Controller connected via TCP Relay tunnel! Message: {:?}", msg);
                             *relay_channel.lock().await = Some(channel.clone());
 
-                            let stream_channel = channel.clone();
                             let is_sharing_stream = Arc::clone(&relay_is_sharing);
                             is_sharing_stream.store(true, std::sync::atomic::Ordering::SeqCst);
 
-                            let capture_task = tokio::spawn(async move {
-                                let mut capturer = match capture::create_capturer() {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        log::error!("Failed to create capturer for relay: {}", e);
-                                        return;
-                                    }
-                                };
-                                let encoder = codec::FrameEncoder::new(70);
-
-                                while is_sharing_stream.load(std::sync::atomic::Ordering::SeqCst) {
-                                    let start = std::time::Instant::now();
-                                    if let Ok(frame) = capturer.capture_frame() {
-                                        if frame.is_dirty {
-                                            if let Ok(jpeg) = encoder.encode(frame.width, frame.height, &frame.data) {
-                                                let screen_msg = protocol::Message::ScreenFrame {
-                                                    data: jpeg,
-                                                    width: frame.width,
-                                                    height: frame.height,
-                                                    timestamp: chrono::Utc::now().timestamp_millis(),
-                                                };
-                                                if let Err(e) = stream_channel.send(&screen_msg).await {
-                                                    log::info!("Relay stream closed: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let elapsed = start.elapsed();
-                                    let target = std::time::Duration::from_millis(33);
-                                    if elapsed < target {
-                                        tokio::time::sleep(target - elapsed).await;
-                                    }
-                                }
-                            });
+                            let capture_task = spawn_screen_stream_task(channel.clone(), Arc::clone(&relay_is_sharing));
 
                             let channel_rx = channel.clone();
                             let input_sim_rx = relay_input_sim.lock().await.clone();
@@ -424,6 +427,7 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
 

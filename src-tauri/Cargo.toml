@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "OpenRemote - Cross-platform Remote Desktop"
 authors = ["OpenRemote Team"]
 edition = "2021"
+default-run = "openremote"
 
 [lib]
 name = "openremote"
