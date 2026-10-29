@@ -81,50 +81,40 @@ npm run tauri build
 
 ## 🐳 Docker 一键部署中继与信令服务器 (方案 B)
 
-OpenRemote 包含一套极致轻量的中继与信令服务（位于 `server/` 目录），仅需 **10MB 内存**，零外部数据库依赖，可部署在任何 1 核 512M 的轻量云服务器（腾讯云、阿里云、华为云、AWS 等）上。
+在任何 Linux 云服务器上，只需标准 3 步即可拉起：
 
-### 🚀 方式一：Linux 云服务器单行一键安装（全自动）
-
-在你的 Linux VPS 终端上直接执行以下命令：
 ```bash
-curl -fsSL https://raw.githubusercontent.com/XCool-603/openremote/main/server/deploy.sh | sudo bash
-```
-> **该命令会自动执行**：系统架构检测 -> 自动安装 Docker -> 配置开机自启 -> 放行防火墙端口 -> 启动容器 -> 打印公网配置信息。
+# 1. 克隆仓库
+git clone https://github.com/XCool-603/openremote.git
 
----
+# 2. 进入中继服务目录
+cd openremote/server
 
-### 🐳 方式二：已有 Docker 服务器单条命令启动
+# 3. 启动中继容器 (二选一)
 
-无需克隆整个项目仓库，复制执行即可：
-```bash
-mkdir -p /opt/openremote-server && cd /opt/openremote-server
-curl -fsSL https://raw.githubusercontent.com/XCool-603/openremote/main/server/signaling.js -o signaling.js
+# 方式 A: 直接使用 Docker Compose (推荐)
+docker compose up -d
+
+# 方式 B: 使用纯 Docker 命令
+docker build -t openremote-relay .
 docker run -d \
   --name openremote-relay \
   --restart always \
-  -v /opt/openremote-server/signaling.js:/app/signaling.js \
-  -w /app \
   -p 28844:28844/tcp \
   -p 28844:28844/udp \
   -p 28845:28845/tcp \
-  node:20-alpine node signaling.js
+  openremote-relay
 ```
 
----
-
-### 🛡️ 云平台安全组开放规则（必做）
-
-部署完成后，请在腾讯云/阿里云/华为云等**云控制台安全组**添加入方向放行规则：
-- **`28844 / TCP`**：HTTP 信令 API 与 9 位设备代码心跳注册
-- **`28844 / UDP`**：STUN 协议公网端口反射与打洞
+### 🛡️ 云平台安全组开放端口
+在腾讯云/阿里云/华为云等**控制台安全组**中开放以下 3 个端口：
+- **`28844 / TCP`**：HTTP 信令与 9 位设备码在线心跳
+- **`28844 / UDP`**：STUN 公网端口探测
 - **`28845 / TCP`**：TCP 流量穿透中继隧道
 
-### 🔍 验证运行
-浏览器打开：`http://<你的服务器公网IP>:28844/api/status`
-看到 `{"status": "online", ...}` 即表示部署成功！
-
-### 📱 客户端配置
-在 OpenRemote 软件中点击左侧 **【设置】** -> 将 **信令服务器地址** 修改为 `http://<你的服务器公网IP>:28844` 并保存，即可享受无视内网限制的全球设备穿透连接！详细文档请参阅 [server/README.md](./server/README.md)。
+### 🔍 验证与配置
+- **验证**：浏览器访问 `http://<服务器IP>:28844/api/status` 显示 `online` 即表示成功。
+- **客户端配置**：打开 OpenRemote 软件 -> **设置** -> 将**信令服务器地址**填入 `http://<服务器IP>:28844` 保存即可。
 
 ---
 
