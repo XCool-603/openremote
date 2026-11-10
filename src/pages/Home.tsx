@@ -15,45 +15,59 @@ import {
   ExternalLink,
 } from 'lucide-react';
 
-const INITIAL_DEVICES: PeerDevice[] = [
-  {
-    id: 'dev-001',
-    name: '办公室工作站 (Windows 11)',
-    address: '192.168.1.105:28843',
-    status: 'online',
-    last_seen: '刚刚',
-    mac_address: '00:1A:2B:3C:4D:5E',
-  },
-  {
-    id: 'dev-002',
-    name: '家庭影音服务器 (Ubuntu)',
-    address: '192.168.1.200:28843',
-    status: 'online',
-    last_seen: '5分钟前',
-    mac_address: '00:11:22:33:44:55',
-  },
-  {
-    id: 'dev-003',
-    name: '客厅游戏主机 (RTX 4090)',
-    address: '192.168.1.188:28843',
-    status: 'offline',
-    last_seen: '昨天 22:30',
-    mac_address: '04:D4:C4:B4:A4:94',
-  },
-];
+const SAVED_DEVICES_KEY = 'openremote_saved_devices';
 
 export const Home: React.FC = () => {
   const navigate = useNavigate();
   const { isConnected, peerAddress, connect, disconnect, setDeviceInfo, deviceInfo } =
     useConnectionStore();
 
-  const [devices, setDevices] = useState<PeerDevice[]>(INITIAL_DEVICES);
+  const [devices, setDevices] = useState<PeerDevice[]>(() => {
+    try {
+      const saved = localStorage.getItem(SAVED_DEVICES_KEY);
+      if (saved) {
+        return JSON.parse(saved);
+      }
+    } catch (e) {
+      console.warn('Failed to parse saved devices:', e);
+    }
+    return [];
+  });
   const [searchQuery, setSearchQuery] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [connectAddress, setConnectAddress] = useState('');
   const [copied, setCopied] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
+
+  const saveDeviceRecord = (address: string, name?: string) => {
+    setDevices((prev) => {
+      const existing = prev.find((d) => d.address === address);
+      let updated: PeerDevice[];
+      if (existing) {
+        updated = prev.map((d) =>
+          d.address === address
+            ? { ...d, last_seen: '刚刚', name: name || d.name, status: 'online' as const }
+            : d
+        );
+      } else {
+        const newDevice: PeerDevice = {
+          id: `dev_${Date.now()}`,
+          name: name || `远程设备 (${address})`,
+          address,
+          status: 'online',
+          last_seen: '刚刚',
+        };
+        updated = [newDevice, ...prev];
+      }
+      try {
+        localStorage.setItem(SAVED_DEVICES_KEY, JSON.stringify(updated));
+      } catch (e) {
+        console.warn('Failed to save devices to storage:', e);
+      }
+      return updated;
+    });
+  };
 
   // Load device info on mount
   useEffect(() => {
@@ -92,6 +106,7 @@ export const Home: React.FC = () => {
     setStatusNotice(`正在连接到 ${name} (${address})...`);
     try {
       await safeInvoke('connect_to_device', { address });
+      saveDeviceRecord(address, name);
       connect(address, name);
       setStatusNotice(null);
       navigate('/remote');
@@ -108,16 +123,18 @@ export const Home: React.FC = () => {
     if (!connectAddress.trim()) return;
 
     setConnecting(true);
-    setStatusNotice(`正在直连到 ${connectAddress}...`);
+    setStatusNotice(`正在连接目标设备 ${connectAddress}...`);
     try {
       await safeInvoke('connect_to_device', { address: connectAddress });
-      connect(connectAddress, `远程设备 (${connectAddress})`);
+      const deviceTitle = `远程电脑 (${connectAddress})`;
+      saveDeviceRecord(connectAddress, deviceTitle);
+      connect(connectAddress, deviceTitle);
       setIsModalOpen(false);
       setStatusNotice(null);
       navigate('/remote');
     } catch (err) {
       console.error('Direct connect failed:', err);
-      setStatusNotice(`直连失败: ${err || '请检查地址格式与端口 (例如 192.168.1.50:28843)'}`);
+      setStatusNotice(`连接失败: ${err || '请确认 9 位代码或 IP 地址正确'}`);
     } finally {
       setConnecting(false);
     }

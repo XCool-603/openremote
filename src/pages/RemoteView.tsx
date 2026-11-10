@@ -404,13 +404,9 @@ export const RemoteView: React.FC = () => {
               请在“设备列表”中选择在线主机发起连接，或者直接输入远程桌面 IP / 识别码快速进入。
             </p>
             <div className="flex items-center justify-center gap-3">
-              <button
-                onClick={() => connect('192.168.1.105:8443', '办公室工作站 (演示)')}
-                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-primary hover:bg-primary-dark text-white text-xs font-semibold shadow-lg shadow-primary/25 transition-all"
-              >
-                <Play className="w-3.5 h-3.5" />
-                演示快速连接
-              </button>
+              <span className="text-xs text-zinc-500">
+                请在主页输入伙伴的 9 位设备代码一键发起跨网穿透连接
+              </span>
             </div>
           </div>
         )}

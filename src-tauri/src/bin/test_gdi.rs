@@ -2,8 +2,7 @@ use anyhow::Result;
 
 #[link(name = "user32")]
 extern "system" {
-    fn GetDesktopWindow() -> isize;
-    fn GetWindowDC(hWnd: isize) -> isize;
+    fn GetDC(hWnd: isize) -> isize;
     fn ReleaseDC(hWnd: isize, hDC: isize) -> i32;
     fn GetSystemMetrics(nIndex: i32) -> i32;
     fn GetLastError() -> u32;
@@ -59,81 +58,42 @@ struct BITMAPINFO {
     bmi_colors: [u32; 1],
 }
 
-fn capture_screen() -> Result<(u32, u32, usize)> {
+fn test_capture_null_dc() -> Result<()> {
     unsafe {
-        let width = GetSystemMetrics(0); // SM_CXSCREEN
-        let height = GetSystemMetrics(1); // SM_CYSCREEN
-        println!("Screen resolution: {}x{}", width, height);
+        let width = GetSystemMetrics(0);
+        let height = GetSystemMetrics(1);
+        println!("Resolution: {}x{}", width, height);
 
-        let hwnd = GetDesktopWindow();
-        let hdc_screen = GetWindowDC(hwnd);
+        let hdc_screen = GetDC(0);
         if hdc_screen == 0 {
-            return Err(anyhow::anyhow!("GetWindowDC(desktop) returned NULL"));
+            return Err(anyhow::anyhow!("GetDC(NULL) failed"));
         }
 
         let hdc_mem = CreateCompatibleDC(hdc_screen);
-        if hdc_mem == 0 {
-            ReleaseDC(hwnd, hdc_screen);
-            return Err(anyhow::anyhow!("CreateCompatibleDC failed"));
-        }
+        let hbm = CreateCompatibleBitmap(hdc_screen, width, height);
+        let old = SelectObject(hdc_mem, hbm);
 
-        let hbitmap = CreateCompatibleBitmap(hdc_screen, width, height);
-        if hbitmap == 0 {
-            DeleteDC(hdc_mem);
-            ReleaseDC(hwnd, hdc_screen);
-            return Err(anyhow::anyhow!("CreateCompatibleBitmap failed"));
-        }
+        // Try standard SRCCOPY (0x00CC0020) without CAPTUREBLT
+        let ok = BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, 0x00CC0020);
+        let err = if ok == 0 { GetLastError() } else { 0 };
 
-        let old_bitmap = SelectObject(hdc_mem, hbitmap);
-
-        // SRCCOPY | CAPTUREBLT (0x40000000 ensures layered windows/RDP windows are captured)
-        let rop = 0x00CC0020 | 0x40000000;
-        let success = BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, 0, 0, rop);
-
-        if success == 0 {
-            let err = GetLastError();
-            SelectObject(hdc_mem, old_bitmap);
-            DeleteObject(hbitmap);
-            DeleteDC(hdc_mem);
-            ReleaseDC(hwnd, hdc_screen);
-            return Err(anyhow::anyhow!("BitBlt failed: GetLastError = {}", err));
-        }
-
-        let mut bmi: BITMAPINFO = std::mem::zeroed();
-        bmi.bmi_header.bi_size = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmi_header.bi_width = width;
-        bmi.bmi_header.bi_height = -height; // Negative for top-down DIB
-        bmi.bmi_header.bi_planes = 1;
-        bmi.bmi_header.bi_bit_count = 32;
-        bmi.bmi_header.bi_compression = 0; // BI_RGB
-
-        let mut buffer = vec![0u8; (width * height * 4) as usize];
-        let lines = GetDIBits(
-            hdc_mem,
-            hbitmap,
-            0,
-            height as u32,
-            buffer.as_mut_ptr(),
-            &mut bmi,
-            0,
-        );
-
-        SelectObject(hdc_mem, old_bitmap);
-        DeleteObject(hbitmap);
+        SelectObject(hdc_mem, old);
+        DeleteObject(hbm);
         DeleteDC(hdc_mem);
-        ReleaseDC(hwnd, hdc_screen);
+        ReleaseDC(0, hdc_screen);
 
-        if lines == 0 {
-            return Err(anyhow::anyhow!("GetDIBits failed"));
+        if ok != 0 {
+            println!("🎉 GetDC(0) + BitBlt(SRCCOPY) 成功抓取！");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("BitBlt failed: error {}", err))
         }
-
-        Ok((width as u32, height as u32, buffer.len()))
     }
 }
 
 fn main() {
-    match capture_screen() {
-        Ok((w, h, sz)) => println!("🎉 捕获成功！分辨率: {}x{}, 缓冲区大小: {} 字节", w, h, sz),
-        Err(e) => eprintln!("❌ 捕获失败: {}", e),
+    match test_capture_null_dc() {
+        Ok(_) => println!("✅ GDI 测试通过！"),
+        Err(e) => eprintln!("❌ GDI 测试失败: {}", e),
     }
 }
