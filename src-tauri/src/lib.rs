@@ -169,6 +169,17 @@ pub fn run() {
 
                                 let _capture_task = spawn_screen_stream_task(channel.clone(), is_sharing_stream);
 
+                                // Start clipboard sync on host for direct QUIC session
+                                let mut host_clipboard = clipboard::ClipboardMonitor::new();
+                                let channel_cb = channel.clone();
+                                host_clipboard.start_monitoring(move |text| {
+                                    let chan = channel_cb.clone();
+                                    tokio::spawn(async move {
+                                        let msg = protocol::Message::ClipboardUpdate { content: text };
+                                        let _ = chan.send(&msg).await;
+                                    });
+                                });
+
                                 let channel_rx = channel.clone();
                                 let input_sim_rx = input_sim.lock().await.clone();
                                 let is_sharing_clone = Arc::clone(&is_sharing);
@@ -213,9 +224,9 @@ pub fn run() {
                                                 }
                                                 protocol::Message::ClipboardUpdate { content } => {
                                                     let _ =
-                                                        clipboard::ClipboardMonitor::set_text(
+                                                        clipboard::ClipboardMonitor::set_text_silent(
                                                             &content,
-                                                        );
+                                                        ).await;
                                                 }
                                                 protocol::Message::FileTransferStart {
                                                     id,
@@ -262,6 +273,7 @@ pub fn run() {
                                             }
                                         }
                                     }
+                                    host_clipboard.stop_monitoring();
                                 });
                             }
                             Err(e) => {
@@ -324,6 +336,17 @@ pub fn run() {
 
                             let capture_task = spawn_screen_stream_task(channel.clone(), Arc::clone(&relay_is_sharing));
 
+                            // Start clipboard sync on host for TCP Relay session
+                            let mut host_clipboard = clipboard::ClipboardMonitor::new();
+                            let channel_cb = channel.clone();
+                            host_clipboard.start_monitoring(move |text| {
+                                let chan = channel_cb.clone();
+                                tokio::spawn(async move {
+                                    let msg = protocol::Message::ClipboardUpdate { content: text };
+                                    let _ = chan.send(&msg).await;
+                                });
+                            });
+
                             let channel_rx = channel.clone();
                             let input_sim_rx = relay_input_sim.lock().await.clone();
                             let is_sharing_clone = Arc::clone(&relay_is_sharing);
@@ -367,9 +390,9 @@ pub fn run() {
                                         }
                                         protocol::Message::ClipboardUpdate { content } => {
                                             let _ =
-                                                clipboard::ClipboardMonitor::set_text(
+                                                clipboard::ClipboardMonitor::set_text_silent(
                                                     &content,
-                                                );
+                                                ).await;
                                         }
                                         protocol::Message::FileTransferStart {
                                             id,
@@ -415,6 +438,7 @@ pub fn run() {
                                     }
                                 }
                             }
+                            host_clipboard.stop_monitoring();
                             capture_task.abort();
                         }
                         Err(e) => {

@@ -344,6 +344,25 @@ pub async fn connect_to_device(
     // Store connection channel
     *state.active_channel.lock().await = Some(channel.clone());
 
+    // Stop previous clipboard monitor if any
+    if let Some(old_monitor) = state.clipboard_monitor.lock().await.take() {
+        old_monitor.stop_monitoring();
+    }
+
+    // Automatically start bi-directional clipboard sync on controller
+    let mut ctrl_clipboard = ClipboardMonitor::new();
+    let channel_cb = channel.clone();
+    ctrl_clipboard.start_monitoring(move |text| {
+        let chan = channel_cb.clone();
+        tokio::spawn(async move {
+            let msg = Message::ClipboardUpdate { content: text };
+            if let Err(e) = chan.send(&msg).await {
+                log::warn!("Failed to sync local clipboard to peer: {}", e);
+            }
+        });
+    });
+    *state.clipboard_monitor.lock().await = Some(ctrl_clipboard);
+
     // Spawn receiver task for incoming messages (e.g. screen frames or clipboard or file reception)
     let app_handle_clone = app_handle.clone();
     let receivers_clone = Arc::clone(&state.transfer_receivers);
@@ -385,7 +404,7 @@ pub async fn connect_to_device(
                         handle_file_chunk(id, offset, data, is_last, Arc::clone(&receivers_clone)).await;
                     }
                     Message::ClipboardUpdate { content } => {
-                        let _ = ClipboardMonitor::set_text(&content);
+                        let _ = ClipboardMonitor::set_text_silent(&content).await;
                     }
                     Message::Ping { timestamp } => {
                         let _ = channel.send(&Message::Pong { timestamp }).await;
@@ -442,6 +461,9 @@ pub async fn send_key_event(
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
     state.is_sharing.store(false, Ordering::SeqCst);
+    if let Some(monitor) = state.clipboard_monitor.lock().await.take() {
+        monitor.stop_monitoring();
+    }
     *state.active_channel.lock().await = None;
     Ok(())
 }
@@ -678,6 +700,18 @@ pub async fn send_shortcut(
                 let _ = channel.send(&Message::KeyEvent { key: "Alt".to_string(), action: crate::protocol::KeyAction::Down }).await;
                 let _ = channel.send(&Message::KeyEvent { key: "Tab".to_string(), action: crate::protocol::KeyAction::Click }).await;
                 let _ = channel.send(&Message::KeyEvent { key: "Alt".to_string(), action: crate::protocol::KeyAction::Up }).await;
+            }
+            "WinE" => {
+                let _ = channel.send(&Message::KeyEvent { key: "Meta".to_string(), action: crate::protocol::KeyAction::Down }).await;
+                let _ = channel.send(&Message::KeyEvent { key: "e".to_string(), action: crate::protocol::KeyAction::Click }).await;
+                let _ = channel.send(&Message::KeyEvent { key: "Meta".to_string(), action: crate::protocol::KeyAction::Up }).await;
+            }
+            "TaskMgr" => {
+                let _ = channel.send(&Message::KeyEvent { key: "Control".to_string(), action: crate::protocol::KeyAction::Down }).await;
+                let _ = channel.send(&Message::KeyEvent { key: "Shift".to_string(), action: crate::protocol::KeyAction::Down }).await;
+                let _ = channel.send(&Message::KeyEvent { key: "Escape".to_string(), action: crate::protocol::KeyAction::Click }).await;
+                let _ = channel.send(&Message::KeyEvent { key: "Shift".to_string(), action: crate::protocol::KeyAction::Up }).await;
+                let _ = channel.send(&Message::KeyEvent { key: "Control".to_string(), action: crate::protocol::KeyAction::Up }).await;
             }
             _ => {}
         }

@@ -329,21 +329,35 @@ export const RemoteView: React.FC = () => {
               <div className="hidden lg:flex items-center gap-1 border-l border-surface-lighter pl-2">
                 <button
                   onClick={() => sendShortcut('CtrlAltDel')}
-                  className="px-2 py-1 rounded bg-surface-light hover:bg-surface-lighter border border-surface-lighter text-[11px] text-zinc-300 font-mono"
+                  className="px-2 py-1 rounded bg-surface-light hover:bg-surface-lighter border border-surface-lighter text-[11px] text-zinc-300 font-mono transition-colors"
                   title="向被控端发送 Ctrl+Alt+Del"
                 >
                   Ctrl+Alt+Del
                 </button>
                 <button
+                  onClick={() => sendShortcut('TaskMgr')}
+                  className="px-2 py-1 rounded bg-surface-light hover:bg-surface-lighter border border-surface-lighter text-[11px] text-zinc-300 font-mono transition-colors"
+                  title="向被控端发送 Ctrl+Shift+Esc 打开任务管理器"
+                >
+                  任务管理器
+                </button>
+                <button
                   onClick={() => sendShortcut('WinD')}
-                  className="px-2 py-1 rounded bg-surface-light hover:bg-surface-lighter border border-surface-lighter text-[11px] text-zinc-300 font-mono"
+                  className="px-2 py-1 rounded bg-surface-light hover:bg-surface-lighter border border-surface-lighter text-[11px] text-zinc-300 font-mono transition-colors"
                   title="向被控端发送 Win+D 显示桌面"
                 >
                   Win+D
                 </button>
                 <button
+                  onClick={() => sendShortcut('WinE')}
+                  className="px-2 py-1 rounded bg-surface-light hover:bg-surface-lighter border border-surface-lighter text-[11px] text-zinc-300 font-mono transition-colors"
+                  title="向被控端发送 Win+E 打开我的电脑"
+                >
+                  资源管理器
+                </button>
+                <button
                   onClick={() => sendShortcut('AltTab')}
-                  className="px-2 py-1 rounded bg-surface-light hover:bg-surface-lighter border border-surface-lighter text-[11px] text-zinc-300 font-mono"
+                  className="px-2 py-1 rounded bg-surface-light hover:bg-surface-lighter border border-surface-lighter text-[11px] text-zinc-300 font-mono transition-colors"
                   title="向被控端发送 Alt+Tab 切换窗口"
                 >
                   Alt+Tab
