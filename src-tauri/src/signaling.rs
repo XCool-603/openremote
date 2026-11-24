@@ -199,13 +199,104 @@ pub fn parse_relay_address(signal_url: &str) -> String {
     format!("{}:28845", host)
 }
 
-/// Connect to TCP Relay server and join a session by device code
+/// Login to signaling server and retrieve (username, token)
+pub async fn auth_login(server_url: &str, username: &str, password: &str) -> Result<(String, String)> {
+    let payload = serde_json::json!({
+        "username": username,
+        "password": password,
+    });
+    let res = send_http_request("POST", server_url, "/api/auth/login", Some(&payload.to_string())).await?;
+    let json: serde_json::Value = serde_json::from_str(&res)
+        .map_err(|e| anyhow!("服务器登录响应解析失败: {} (raw: {})", e, res))?;
+
+    if json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let user = json
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or(username)
+            .to_string();
+        let token = json
+            .get("token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("服务器未返回有效登录凭证 Token"))?
+            .to_string();
+        Ok((user, token))
+    } else {
+        let err_msg = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("登录失败，请检查账号或密码");
+        Err(anyhow!("{}", err_msg))
+    }
+}
+
+/// Register a new account on the signaling server and retrieve (username, token)
+pub async fn auth_register(server_url: &str, username: &str, password: &str) -> Result<(String, String)> {
+    let payload = serde_json::json!({
+        "username": username,
+        "password": password,
+    });
+    let res = send_http_request("POST", server_url, "/api/auth/register", Some(&payload.to_string())).await?;
+    let json: serde_json::Value = serde_json::from_str(&res)
+        .map_err(|e| anyhow!("服务器注册响应解析失败: {} (raw: {})", e, res))?;
+
+    if json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let user = json
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or(username)
+            .to_string();
+        let token = json
+            .get("token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("服务器未返回有效登录凭证 Token"))?
+            .to_string();
+        Ok((user, token))
+    } else {
+        let err_msg = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("注册失败，请稍后重试");
+        Err(anyhow!("{}", err_msg))
+    }
+}
+
+/// Connect to TCP Relay server and join a session by device code with authentication token
+pub async fn join_relay_tunnel_with_token(
+    relay_addr: &str,
+    device_code: &str,
+    auth_token: Option<&str>,
+) -> Result<TcpStream> {
+    let token = auth_token
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow!("请先登录账号！连接云端中继服务器需要账号登录鉴权"))?;
+
+    let clean = clean_code(device_code);
+    let mut stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(relay_addr))
+        .await
+        .map_err(|_| anyhow!("连接中继服务器 {} 超时", relay_addr))?
+        .map_err(|e| anyhow!("无法连接中继服务器 {}: {}", relay_addr, e))?;
+
+    let _ = stream.set_nodelay(true);
+
+    // Protocol: "OPRM_RELAY <sessionId> CTRL <token>\n"
+    let cmd = format!("OPRM_RELAY {} CTRL {}\n", clean, token);
+    stream.write_all(cmd.as_bytes()).await?;
+    stream.flush().await?;
+
+    Ok(stream)
+}
+
+/// Connect to TCP Relay server and join a session by device code (legacy helper for CLI tests)
 pub async fn join_relay_tunnel(relay_addr: &str, device_code: &str) -> Result<TcpStream> {
     let clean = clean_code(device_code);
     let mut stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(relay_addr))
         .await
         .map_err(|_| anyhow!("连接中继服务器 {} 超时", relay_addr))?
         .map_err(|e| anyhow!("无法连接中继服务器 {}: {}", relay_addr, e))?;
+
+    let _ = stream.set_nodelay(true);
 
     // Protocol: "OPRM_RELAY <sessionId> CTRL\n"
     let cmd = format!("OPRM_RELAY {} CTRL\n", clean);
@@ -215,18 +306,32 @@ pub async fn join_relay_tunnel(relay_addr: &str, device_code: &str) -> Result<Tc
     Ok(stream)
 }
 
-/// Connect to TCP Relay server and register as host waiting for peer join
-pub async fn register_relay_tunnel(relay_addr: &str, device_code: &str) -> Result<TcpStream> {
+/// Connect to TCP Relay server and register as host waiting for peer join (with optional token)
+pub async fn register_relay_tunnel_with_token(
+    relay_addr: &str,
+    device_code: &str,
+    auth_token: Option<&str>,
+) -> Result<TcpStream> {
     let clean = clean_code(device_code);
     let mut stream = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(relay_addr))
         .await
         .map_err(|_| anyhow!("连接中继服务器 {} 超时", relay_addr))?
         .map_err(|e| anyhow!("无法连接中继服务器 {}: {}", relay_addr, e))?;
 
-    // Protocol: "OPRM_RELAY <sessionId> HOST\n"
-    let cmd = format!("OPRM_RELAY {} HOST\n", clean);
+    let _ = stream.set_nodelay(true);
+
+    let cmd = if let Some(tok) = auth_token.map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        format!("OPRM_RELAY {} HOST {}\n", clean, tok)
+    } else {
+        format!("OPRM_RELAY {} HOST\n", clean)
+    };
     stream.write_all(cmd.as_bytes()).await?;
     stream.flush().await?;
 
     Ok(stream)
+}
+
+/// Connect to TCP Relay server and register as host waiting for peer join
+pub async fn register_relay_tunnel(relay_addr: &str, device_code: &str) -> Result<TcpStream> {
+    register_relay_tunnel_with_token(relay_addr, device_code, None).await
 }

@@ -1,9 +1,6 @@
 use anyhow::Result;
 use openremote::protocol::Message;
 use openremote::signaling;
-use openremote::transport::ConnectionChannel;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,22 +19,29 @@ async fn main() -> Result<()> {
     println!("📍 测试中继地址: {}", relay_addr);
     println!("📍 设备代码: {}", test_device_code);
 
-    let is_running = Arc::new(AtomicBool::new(true));
-    let is_running_host = is_running.clone();
+    let auth_token = signaling::auth_login(signal_url, "admin", "123456")
+        .await
+        .ok()
+        .map(|(_, tok)| tok);
 
     // 1. 模拟被控端（Host）连接中继并待命
     println!("\n[1/4] 启动被控端 (Host)，正在连接中继并注册...");
-    let host_stream = signaling::register_relay_tunnel(&relay_addr, &test_device_code).await?;
+    let host_stream = signaling::register_relay_tunnel_with_token(
+        &relay_addr,
+        &test_device_code,
+        auth_token.as_deref(),
+    )
+    .await?;
     println!("✅ 被控端 (Host) 注册成功，正在等待控制端连入...");
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // 2. 模拟控制端（Ctrl）连接中继并连入
     println!("\n[2/4] 启动控制端 (Ctrl)，正在通过中继加入该设备...");
-    let ctrl_stream = signaling::join_relay_tunnel(&relay_addr, &test_device_code).await?;
+    let ctrl_stream = if let Some(ref tok) = auth_token {
+        signaling::join_relay_tunnel_with_token(&relay_addr, &test_device_code, Some(tok)).await?
+    } else {
+        signaling::join_relay_tunnel(&relay_addr, &test_device_code).await?
+    };
     println!("✅ 控制端 (Ctrl) 握手成功!");
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let host_channel = openremote::transport::ConnectionChannel::new_tcp(host_stream);
     let ctrl_channel = openremote::transport::ConnectionChannel::new_tcp(ctrl_stream);

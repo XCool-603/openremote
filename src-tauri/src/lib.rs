@@ -480,6 +480,10 @@ pub fn run() {
             commands::send_key_event,
             commands::open_download_dir,
             commands::send_shortcut,
+            commands::get_auth_status,
+            commands::login_account,
+            commands::register_account,
+            commands::logout_account,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

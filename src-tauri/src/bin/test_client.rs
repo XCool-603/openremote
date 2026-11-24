@@ -27,9 +27,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 2. 连接 TCP 中继隧道
-    println!("\n[2/3] 正在连接 TCP Relay 中继隧道 {}...", relay_addr);
-    let stream = signaling::join_relay_tunnel(&relay_addr, target_code).await?;
+    // 2. 登录账号获取中继鉴权 Token 并连接 TCP 中继隧道
+    println!("\n[2/3] 正在登录账号并连接 TCP Relay 中继隧道 {}...", relay_addr);
+    let stream = match signaling::auth_login(signal_url, "admin", "123456").await {
+        Ok((user, token)) => {
+            println!("✅ 账号 '{}' 登录成功，已获取中继鉴权 Token!", user);
+            signaling::join_relay_tunnel_with_token(&relay_addr, target_code, Some(&token)).await?
+        }
+        Err(e) => {
+            println!("ℹ️ 账号登录返回 ({})，尝试免密兼容模式连接...", e);
+            signaling::join_relay_tunnel(&relay_addr, target_code).await?
+        }
+    };
     println!("✅ 成功建立中继隧道连接并发送握手头!");
 
     let channel = ConnectionChannel::new_tcp(stream);

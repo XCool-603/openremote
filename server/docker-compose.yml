@@ -4,13 +4,16 @@ services:
     container_name: openremote-relay
     restart: always
     ports:
-      - "28844:28844/tcp"   # HTTP 信令与设备注册
+      - "28844:28844/tcp"   # HTTP 信令、账号登录注册与状态 API
       - "28844:28844/udp"   # STUN NAT 端口反射
-      - "28845:28845/tcp"   # TCP 数据中继隧道
+      - "28845:28845/tcp"   # TCP 数据中继隧道 (需登录鉴权)
+    volumes:
+      - ./data:/app/data
     environment:
       - PORT=28844
       - UDP_PORT=28844
       - RELAY_PORT=28845
+      - REQUIRE_RELAY_AUTH=true
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:28844/api/status"]
       interval: 30s

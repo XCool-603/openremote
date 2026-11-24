@@ -301,9 +301,9 @@ pub async fn connect_to_device(
             // Direct QUIC connection to all candidates failed.
             // Automatic fallback to TCP Relay Tunnel via dxcool.cn:28845!
             if crate::signaling::is_device_code(&address) {
-                let signal_url = {
+                let (signal_url, auth_token) = {
                     let config = state.config.lock().await;
-                    config.signal_server_url.clone()
+                    (config.signal_server_url.clone(), config.auth_token.clone())
                 };
                 let relay_addr = crate::signaling::parse_relay_address(&signal_url);
                 log::info!(
@@ -311,16 +311,19 @@ pub async fn connect_to_device(
                     relay_addr,
                     address
                 );
-                match crate::signaling::join_relay_tunnel(&relay_addr, &address).await {
+                match crate::signaling::join_relay_tunnel_with_token(
+                    &relay_addr,
+                    &address,
+                    auth_token.as_deref(),
+                )
+                .await
+                {
                     Ok(tcp_stream) => {
                         log::info!("Successfully established TCP Relay tunnel to {}", address);
                         ConnectionChannel::new_tcp(tcp_stream)
                     }
                     Err(e) => {
-                        return Err(format!(
-                            "直连与中继穿透均失败: 直连最后错误: {}, 中继错误: {}",
-                            last_err, e
-                        ));
+                        return Err(format!("{}", e));
                     }
                 }
             } else {
@@ -717,4 +720,95 @@ pub async fn send_shortcut(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthStatus {
+    pub authenticated: bool,
+    pub username: Option<String>,
+    pub token: Option<String>,
+}
+
+/// Get current logged-in account status
+#[tauri::command]
+pub async fn get_auth_status(state: State<'_, AppState>) -> Result<AuthStatus, String> {
+    let cfg = state.config.lock().await;
+    let token = cfg.auth_token.clone().filter(|t| !t.trim().is_empty());
+    let username = cfg.auth_username.clone().filter(|u| !u.trim().is_empty());
+    Ok(AuthStatus {
+        authenticated: token.is_some(),
+        username,
+        token,
+    })
+}
+
+/// Login to signaling & relay server account
+#[tauri::command]
+pub async fn login_account(
+    username: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<AuthStatus, String> {
+    let signal_url = {
+        let cfg = state.config.lock().await;
+        cfg.signal_server_url.clone()
+    };
+
+    let (user, token) = crate::signaling::auth_login(&signal_url, &username, &password)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut cfg = state.config.lock().await;
+    cfg.auth_username = Some(user.clone());
+    cfg.auth_token = Some(token.clone());
+    let _ = cfg.save();
+
+    Ok(AuthStatus {
+        authenticated: true,
+        username: Some(user),
+        token: Some(token),
+    })
+}
+
+/// Register a new account on signaling & relay server
+#[tauri::command]
+pub async fn register_account(
+    username: String,
+    password: String,
+    state: State<'_, AppState>,
+) -> Result<AuthStatus, String> {
+    let signal_url = {
+        let cfg = state.config.lock().await;
+        cfg.signal_server_url.clone()
+    };
+
+    let (user, token) = crate::signaling::auth_register(&signal_url, &username, &password)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut cfg = state.config.lock().await;
+    cfg.auth_username = Some(user.clone());
+    cfg.auth_token = Some(token.clone());
+    let _ = cfg.save();
+
+    Ok(AuthStatus {
+        authenticated: true,
+        username: Some(user),
+        token: Some(token),
+    })
+}
+
+/// Logout current account
+#[tauri::command]
+pub async fn logout_account(state: State<'_, AppState>) -> Result<AuthStatus, String> {
+    let mut cfg = state.config.lock().await;
+    cfg.auth_username = None;
+    cfg.auth_token = None;
+    let _ = cfg.save();
+
+    Ok(AuthStatus {
+        authenticated: false,
+        username: None,
+        token: None,
+    })
 }

@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub listen_port: u16,
     pub signal_server_url: String,
     pub auth_token: Option<String>,
+    #[serde(default)]
+    pub auth_username: Option<String>,
 }
 
 fn generate_numeric_device_code() -> String {
@@ -46,6 +48,7 @@ impl Default for AppConfig {
             listen_port: 28843,
             signal_server_url: "http://dxcool.cn:28844".to_string(),
             auth_token: None,
+            auth_username: None,
         }
     }
 }

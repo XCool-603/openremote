@@ -19,8 +19,16 @@ const SAVED_DEVICES_KEY = 'openremote_saved_devices';
 
 export const Home: React.FC = () => {
   const navigate = useNavigate();
-  const { isConnected, peerAddress, connect, disconnect, setDeviceInfo, deviceInfo } =
-    useConnectionStore();
+  const {
+    isConnected,
+    peerAddress,
+    connect,
+    disconnect,
+    setDeviceInfo,
+    deviceInfo,
+    authUser,
+    setAuthModalOpen,
+  } = useConnectionStore();
 
   const [devices, setDevices] = useState<PeerDevice[]>(() => {
     try {
@@ -112,6 +120,10 @@ export const Home: React.FC = () => {
       navigate('/remote');
     } catch (err) {
       console.error('Failed to connect:', err);
+      const errStr = String(err || '');
+      if (errStr.includes('请先登录账号')) {
+        setAuthModalOpen(true);
+      }
       setStatusNotice(`连接到 ${name} 失败: ${err || '请确认目标主机已开启且在同一网络'}`);
     } finally {
       setConnecting(false);
@@ -134,6 +146,10 @@ export const Home: React.FC = () => {
       navigate('/remote');
     } catch (err) {
       console.error('Direct connect failed:', err);
+      const errStr = String(err || '');
+      if (errStr.includes('请先登录账号')) {
+        setAuthModalOpen(true);
+      }
       setStatusNotice(`连接失败: ${err || '请确认 9 位代码或 IP 地址正确'}`);
     } finally {
       setConnecting(false);
@@ -249,9 +265,24 @@ export const Home: React.FC = () => {
               </form>
             </div>
 
-            <div className="mt-3 text-[11px] text-zinc-400 flex items-center gap-2">
-              <span className="w-1.5 h-1.5 rounded-full bg-primary-light"></span>
-              <span>单机测试提示：在输入框直接填 <strong>127.0.0.1</strong> 即可立即自连测试！</span>
+            <div className="mt-3 pt-2 border-t border-surface-lighter/40 text-[11px] text-zinc-400 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-primary-light"></span>
+                <span>双向剪贴板同步 (Ctrl+C/V) 已默认启用</span>
+              </div>
+              {authUser ? (
+                <span className="text-emerald-400 font-medium">
+                  ✓ 中继账号已登录 ({authUser})
+                </span>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setAuthModalOpen(true)}
+                  className="text-amber-400 hover:underline font-medium"
+                >
+                  ⚠️ 跨网中继需先登录账号 (点击登录)
+                </button>
+              )}
             </div>
           </div>
         </div>
