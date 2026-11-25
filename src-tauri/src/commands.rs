@@ -289,18 +289,66 @@ pub async fn connect_to_device(
     let mut connected_mode = String::new();
     let mut connected_target = String::new();
 
+    let is_code_query = crate::signaling::is_device_code(&address);
+    let signal_url_for_punch = {
+        let config = state.config.lock().await;
+        config.signal_server_url.clone()
+    };
+
     for target_addr in target_addrs {
         log::info!("Attempting QUIC peer connection to candidate {}", target_addr);
-        let client = match QuicClient::new_for_target(&target_addr) {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("Failed creating client endpoint for {}: {}", target_addr, e);
-                continue;
+        let is_public_v4 = match target_addr {
+            SocketAddr::V4(v4) => !v4.ip().is_loopback() && !v4.ip().is_private() && !v4.ip().is_link_local(),
+            SocketAddr::V6(_) => false,
+        };
+
+        let client = if is_code_query && is_public_v4 {
+            if let Ok(ctrl_udp) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                if let Some((ctrl_ip, ctrl_port)) =
+                    crate::nat::probe_stun_on_socket(&ctrl_udp, &signal_url_for_punch)
+                {
+                    let sig_clone = signal_url_for_punch.clone();
+                    let addr_clone = address.clone();
+                    tokio::spawn(async move {
+                        let _ = crate::signaling::request_udp_punch(
+                            &sig_clone,
+                            &addr_clone,
+                            &ctrl_ip,
+                            ctrl_port,
+                        )
+                        .await;
+                    });
+                    // Pre-open controller NAT mapping toward target host
+                    for _ in 0..3 {
+                        let _ = ctrl_udp.send_to(b"OPRM_PUNCH", target_addr);
+                    }
+                }
+                match QuicClient::new_with_socket(ctrl_udp) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        log::warn!("Failed creating punched client endpoint for {}: {}", target_addr, e);
+                        continue;
+                    }
+                }
+            } else {
+                match QuicClient::new_for_target(&target_addr) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                }
+            }
+        } else {
+            match QuicClient::new_for_target(&target_addr) {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Failed creating client endpoint for {}: {}", target_addr, e);
+                    continue;
+                }
             }
         };
 
+        let timeout_ms = if is_public_v4 && is_code_query { 1800 } else { 1200 };
         let connect_fut = client.connect(target_addr);
-        match tokio::time::timeout(std::time::Duration::from_millis(1200), connect_fut).await {
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), connect_fut).await {
             Ok(Ok(chan)) => {
                 log::info!("Successfully connected to candidate {}", target_addr);
                 connected_mode = classify_quic_mode(&target_addr);

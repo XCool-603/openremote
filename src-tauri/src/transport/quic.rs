@@ -28,6 +28,13 @@ pub struct QuicServer {
 impl QuicServer {
     /// Bind QUIC server on given socket address
     pub fn bind(addr: SocketAddr) -> Result<Self> {
+        let socket = std::net::UdpSocket::bind(addr)
+            .with_context(|| format!("Failed to bind UDP socket on {}", addr))?;
+        Self::bind_with_socket(socket)
+    }
+
+    /// Bind QUIC server using an existing UdpSocket (allows STUN probing on the same port first)
+    pub fn bind_with_socket(socket: std::net::UdpSocket) -> Result<Self> {
         let (cert, key) = generate_self_signed_cert()?;
         let server_crypto = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -45,8 +52,15 @@ impl QuicServer {
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
         server_config.transport_config(Arc::new(transport_config));
 
-        let endpoint = Endpoint::server(server_config, addr)
-            .with_context(|| format!("Failed to bind QUIC server on {}", addr))?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow!("No tokio runtime found for QUIC server"))?;
+        let endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
+        .context("Failed to create QUIC server endpoint from socket")?;
 
         let listen_addr = endpoint.local_addr()?;
         log::info!("QUIC server listening on {}", listen_addr);
@@ -145,10 +159,30 @@ impl QuicClient {
         Self::bind_client("0.0.0.0:0".parse()?)
     }
 
+    /// Create QUIC client using a pre-bound UdpSocket (for STUN + coordinated UDP hole punching)
+    pub fn new_with_socket(socket: std::net::UdpSocket) -> Result<Self> {
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow!("No tokio runtime found for QUIC client"))?;
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )
+        .context("Failed to create client QUIC endpoint from socket")?;
+
+        Self::apply_client_config(&mut endpoint)?;
+        Ok(Self { endpoint })
+    }
+
     fn bind_client(bind_addr: SocketAddr) -> Result<Self> {
         let mut endpoint = Endpoint::client(bind_addr)
             .context("Failed to create client QUIC endpoint")?;
+        Self::apply_client_config(&mut endpoint)?;
+        Ok(Self { endpoint })
+    }
 
+    fn apply_client_config(endpoint: &mut Endpoint) -> Result<()> {
         let client_crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(SkipServerVerification::new())
@@ -163,10 +197,8 @@ impl QuicClient {
         transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into().unwrap()));
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
         client_config.transport_config(Arc::new(transport_config));
-
         endpoint.set_default_client_config(client_config);
-
-        Ok(Self { endpoint })
+        Ok(())
     }
 
     /// Connect to remote QUIC server and establish bidirectional stream channel

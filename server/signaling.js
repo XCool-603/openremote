@@ -119,6 +119,10 @@ const relaySessions = new Map();
 // Key: bridgeId -> { sessionId, host, ctrl, user, startedAt }
 const activeBridges = new Map();
 
+// Pending UDP hole-punching requests queued for target hosts
+// Key: normalized target device_code -> Array<{ ctrlIp, ctrlPort, createdAt }>
+const pendingPunches = new Map();
+
 function normalizeCode(code) {
   return String(code || '').replace(/[-\s]/g, '').trim();
 }
@@ -277,6 +281,9 @@ const server = http.createServer(async (req, res) => {
       }
 
       const tokenUser = verifyToken(data.auth_token || req.headers['authorization'] || '');
+      const effectivePublicIp = data.stun_ip || clientIp;
+      const effectivePublicPort = data.stun_port || data.public_port || data.listen_port || 28843;
+
       const peerInfo = {
         deviceId: data.device_id || 'unknown',
         deviceCode: data.device_code,
@@ -284,8 +291,8 @@ const server = http.createServer(async (req, res) => {
         deviceName: data.device_name || 'OpenRemote Peer',
         localIp: data.local_ip || clientIp,
         listenPort: data.listen_port || 28843,
-        publicIp: clientIp,
-        publicPort: data.public_port || data.listen_port || 28843,
+        publicIp: effectivePublicIp,
+        publicPort: effectivePublicPort,
         ipv6: data.ipv6 || null,
         owner: tokenUser || null,
         lastSeen: Date.now(),
@@ -293,13 +300,20 @@ const server = http.createServer(async (req, res) => {
 
       peerRegistry.set(code, peerInfo);
       console.log(
-        `[Signaling] Registered device ${data.device_code} (${peerInfo.deviceName}) IPv4: ${clientIp}, IPv6: ${peerInfo.ipv6 || 'none'}, User: ${tokenUser || 'guest'}`
+        `[Signaling] Registered device ${data.device_code} (${peerInfo.deviceName}) Public: ${effectivePublicIp}:${effectivePublicPort}, IPv6: ${peerInfo.ipv6 || 'none'}, User: ${tokenUser || 'guest'}`
       );
+
+      // Drain any pending UDP hole-punching requests for this host
+      const punches = pendingPunches.get(code) || [];
+      if (punches.length > 0) {
+        pendingPunches.delete(code);
+      }
 
       return sendJson(res, 200, {
         success: true,
-        publicIp: clientIp,
+        publicIp: effectivePublicIp,
         registered: peerInfo,
+        punches,
       });
     } catch {
       return sendJson(res, 400, { error: 'Invalid JSON payload' });
@@ -352,6 +366,39 @@ const server = http.createServer(async (req, res) => {
         message: `Device '${rawCode}' is offline or not found`,
       });
     }
+  }
+
+  // 5.5 Coordinated UDP Hole Punching: POST /api/punch & GET /api/punch/poll/:code
+  if (req.method === 'POST' && url.pathname === '/api/punch') {
+    try {
+      const data = await readJsonBody(req);
+      const targetCode = normalizeCode(data.target_code);
+      const ctrlIp = String(data.ctrl_ip || clientIp).trim();
+      const ctrlPort = parseInt(data.ctrl_port || '0', 10);
+
+      if (!targetCode || !ctrlIp || !ctrlPort) {
+        return sendJson(res, 400, { success: false, error: 'Missing target_code, ctrl_ip, or ctrl_port' });
+      }
+
+      const list = pendingPunches.get(targetCode) || [];
+      list.push({ ctrlIp, ctrlPort, createdAt: Date.now() });
+      pendingPunches.set(targetCode, list.slice(-5));
+      console.log(`[Punch] Queued UDP hole punch -> Host ${targetCode} to reach Ctrl ${ctrlIp}:${ctrlPort}`);
+      return sendJson(res, 200, { success: true });
+    } catch {
+      return sendJson(res, 400, { success: false, error: 'Invalid JSON payload' });
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname.startsWith('/api/punch/poll/')) {
+    const rawCode = url.pathname.replace(/^\/api\/punch\/poll\/?/, '');
+    const code = normalizeCode(rawCode);
+    const list = pendingPunches.get(code) || [];
+    const fresh = list.filter((p) => Date.now() - p.createdAt < 15_000);
+    if (list.length > 0) {
+      pendingPunches.delete(code);
+    }
+    return sendJson(res, 200, { punches: fresh });
   }
 
   // 6. Status & Healthcheck
@@ -602,6 +649,9 @@ const relayServer = net.createServer({ noDelay: true }, (socket) => {
 const udpSocket = dgram.createSocket('udp4');
 
 udpSocket.on('message', (msg, rinfo) => {
+  if (msg.toString('utf8').trim() === 'KEEPALIVE') {
+    return;
+  }
   const response = Buffer.from(
     JSON.stringify({
       type: 'stun-reflexive',

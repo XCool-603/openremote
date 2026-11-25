@@ -128,7 +128,45 @@ pub fn detect_public_ipv6() -> Option<String> {
     None
 }
 
-/// Register local device to the signaling server (including public IPv6 if available)
+/// Register local device to the signaling server (including STUN public IP:port and IPv6)
+pub async fn register_to_signaling_with_stun(
+    server_url: &str,
+    device_id: &str,
+    device_code: &str,
+    device_name: &str,
+    local_ip: &str,
+    listen_port: u16,
+    ipv6: Option<String>,
+    stun_ip: Option<&str>,
+    stun_port: Option<u16>,
+    auth_token: Option<&str>,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "device_id": device_id,
+        "device_code": device_code,
+        "device_name": device_name,
+        "local_ip": local_ip,
+        "listen_port": listen_port,
+        "ipv6": ipv6,
+        "stun_ip": stun_ip,
+        "stun_port": stun_port,
+        "auth_token": auth_token,
+    });
+
+    let body = payload.to_string();
+    let _ = send_http_request("POST", server_url, "/api/register", Some(&body)).await?;
+    log::info!(
+        "Registered device {} with signaling server {} (STUN: {:?}:{:?}, IPv6: {:?})",
+        device_code,
+        server_url,
+        stun_ip,
+        stun_port,
+        ipv6
+    );
+    Ok(())
+}
+
+/// Register local device to the signaling server (legacy wrapper)
 pub async fn register_to_signaling(
     server_url: &str,
     device_id: &str,
@@ -138,19 +176,57 @@ pub async fn register_to_signaling(
     listen_port: u16,
     ipv6: Option<String>,
 ) -> Result<()> {
-    let payload = serde_json::json!({
-        "device_id": device_id,
-        "device_code": device_code,
-        "device_name": device_name,
-        "local_ip": local_ip,
-        "listen_port": listen_port,
-        "ipv6": ipv6,
-    });
+    register_to_signaling_with_stun(
+        server_url, device_id, device_code, device_name, local_ip, listen_port, ipv6, None, None, None,
+    )
+    .await
+}
 
-    let body = payload.to_string();
-    let _ = send_http_request("POST", server_url, "/api/register", Some(&body)).await?;
-    log::info!("Registered device {} with signaling server {} (IPv6: {:?})", device_code, server_url, ipv6);
+/// Ask signaling server to instruct target host to punch UDP hole toward our controller STUN IP:Port
+pub async fn request_udp_punch(
+    server_url: &str,
+    target_code: &str,
+    ctrl_ip: &str,
+    ctrl_port: u16,
+) -> Result<()> {
+    let payload = serde_json::json!({
+        "target_code": clean_code(target_code),
+        "ctrl_ip": ctrl_ip,
+        "ctrl_port": ctrl_port,
+    });
+    let _ = send_http_request("POST", server_url, "/api/punch", Some(&payload.to_string())).await?;
     Ok(())
+}
+
+/// Poll signaling server for incoming UDP hole-punching targets from controllers
+pub async fn poll_udp_punches(
+    server_url: &str,
+    device_code: &str,
+) -> Vec<std::net::SocketAddr> {
+    let code = clean_code(device_code);
+    let path = format!("/api/punch/poll/{}", code);
+    let res = match send_http_request("GET", server_url, &path, None).await {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&res) {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+    let mut addrs = Vec::new();
+    if let Some(arr) = json.get("punches").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let (Some(ip), Some(port)) = (
+                item.get("ctrlIp").and_then(|v| v.as_str()),
+                item.get("ctrlPort").and_then(|v| v.as_u64()),
+            ) {
+                if let Ok(addr) = format!("{}:{}", ip, port).parse::<std::net::SocketAddr>() {
+                    addrs.push(addr);
+                }
+            }
+        }
+    }
+    addrs
 }
 
 /// Lookup target device by device code and retrieve candidate addresses
