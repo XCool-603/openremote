@@ -161,11 +161,12 @@ fn map_mouse_button(button: MouseButton) -> Button {
 }
 
 fn parse_key(key: &str) -> Key {
-    match key.to_lowercase().as_str() {
+    let lower = key.to_lowercase();
+    match lower.as_str() {
         "enter" | "return" => Key::Return,
         "backspace" => Key::Backspace,
         "tab" => Key::Tab,
-        "space" => Key::Space,
+        " " | "space" | "spacebar" => Key::Space,
         "escape" | "esc" => Key::Escape,
         "shift" => Key::Shift,
         "control" | "ctrl" => Key::Control,
@@ -195,7 +196,19 @@ fn parse_key(key: &str) -> Key {
         "f12" => Key::F12,
         s if s.len() == 1 => {
             let ch = s.chars().next().unwrap();
-            Key::Unicode(ch)
+            #[cfg(target_os = "windows")]
+            {
+                // Use Windows Virtual Key codes for ASCII letters and digits so modifier combos (Win+D, Ctrl+C, etc.) work reliably
+                if ch.is_ascii_lowercase() {
+                    let vk = 0x41u32 + (ch as u32 - 'a' as u32);
+                    return Key::Other(vk);
+                }
+                if ch.is_ascii_digit() {
+                    let vk = 0x30u32 + (ch as u32 - '0' as u32);
+                    return Key::Other(vk);
+                }
+            }
+            Key::Unicode(key.chars().next().unwrap())
         }
         _ => Key::Unicode(key.chars().next().unwrap_or(' ')),
     }
