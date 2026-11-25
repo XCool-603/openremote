@@ -60,6 +60,13 @@ async fn main() -> Result<()> {
         tokio::select! {
             res = channel.recv() => {
                 match res {
+                    Ok(Message::TileFrames { screen_w, screen_h, tiles, timestamp }) => {
+                        frame_count += 1;
+                        let total_bytes: usize = tiles.iter().map(|t| t.data.len()).sum();
+                        println!("🎉 [增量帧 #{}] 收到脏矩形画面! 分辨率: {}x{}, 变化块数: {}, 总大小: {} 字节, 时间戳: {}",
+                            frame_count, screen_w, screen_h, tiles.len(), total_bytes, timestamp
+                        );
+                    }
                     Ok(Message::ScreenFrame { width, height, timestamp, data }) => {
                         frame_count += 1;
                         println!("🎉 [帧 #{}] 收到真实屏幕画面! 分辨率: {}x{}, 大小: {} 字节, 时间戳: {}",
