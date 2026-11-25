@@ -30,10 +30,10 @@ struct StreamProfile {
 impl StreamProfile {
     fn new(is_relay: bool) -> Arc<Self> {
         Arc::new(Self {
-            // Relay defaults to balanced low-latency (1280px, Q50); direct QUIC defaults to high quality (1920px, Q70)
-            quality: std::sync::atomic::AtomicU8::new(if is_relay { 50 } else { 70 }),
-            max_width: std::sync::atomic::AtomicU32::new(if is_relay { 1280 } else { 1920 }),
-            fps: std::sync::atomic::AtomicU8::new(30),
+            // Relay defaults to low-latency 18FPS (1024px, Q45) to prevent TCP bufferbloat; direct QUIC defaults to high quality
+            quality: std::sync::atomic::AtomicU8::new(if is_relay { 45 } else { 70 }),
+            max_width: std::sync::atomic::AtomicU32::new(if is_relay { 1024 } else { 1920 }),
+            fps: std::sync::atomic::AtomicU8::new(if is_relay { 18 } else { 30 }),
             native_w: std::sync::atomic::AtomicU32::new(0),
             native_h: std::sync::atomic::AtomicU32::new(0),
             stream_w: std::sync::atomic::AtomicU32::new(0),
@@ -213,10 +213,17 @@ fn spawn_screen_stream_task(
                                     height: out_h,
                                     timestamp: chrono::Utc::now().timestamp_millis(),
                                 };
+                                let send_start = std::time::Instant::now();
                                 if let Err(e) = stream_channel.send(&msg).await {
                                     log::info!("Stream channel closed: {}", e);
                                     is_sharing_stream.store(false, std::sync::atomic::Ordering::SeqCst);
                                     return;
+                                }
+                                let send_dur = send_start.elapsed();
+                                if send_dur > std::time::Duration::from_millis(80) {
+                                    // Backpressure detected: pause briefly so TCP send buffer drains instead of queueing seconds of frames
+                                    let drain_ms = (send_dur.as_millis() as u64).min(300);
+                                    tokio::time::sleep(std::time::Duration::from_millis(drain_ms)).await;
                                 }
                             }
                         }
