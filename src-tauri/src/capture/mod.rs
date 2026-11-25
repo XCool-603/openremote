@@ -1,7 +1,7 @@
 use crate::protocol::DirtyTile;
 use anyhow::Result;
 
-const TILE_SIZE: usize = 128;
+const TILE_SIZE: usize = 256;
 
 /// Represents a single captured raw frame
 #[derive(Debug, Clone)]

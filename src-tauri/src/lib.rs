@@ -80,20 +80,37 @@ async fn handle_host_incoming_message(
             delta_y,
         } => {
             if let Some(ref sim) = input_sim_rx {
-                let (mx, my) = profile.map_coords(x, y);
-                let _ = sim.handle_mouse_event(&protocol::MouseEvent {
+                let sw = profile.stream_w.load(std::sync::atomic::Ordering::Relaxed) as i64;
+                let sh = profile.stream_h.load(std::sync::atomic::Ordering::Relaxed) as i64;
+                let (mx, my) = if let Some((dw, dh)) = sim.screen_size() {
+                    if sw > 0 && sh > 0 && dw > 0 && dh > 0 {
+                        (
+                            ((x as i64 * dw as i64) / sw).clamp(0, dw as i64 - 1) as i32,
+                            ((y as i64 * dh as i64) / sh).clamp(0, dh as i64 - 1) as i32,
+                        )
+                    } else {
+                        profile.map_coords(x, y)
+                    }
+                } else {
+                    profile.map_coords(x, y)
+                };
+                if let Err(e) = sim.handle_mouse_event(&protocol::MouseEvent {
                     x: mx,
                     y: my,
                     button,
                     action,
                     delta_x,
                     delta_y,
-                });
+                }) {
+                    log::warn!("Mouse input error at ({}, {}): {}", mx, my, e);
+                }
             }
         }
         protocol::Message::KeyEvent { key, action } => {
             if let Some(ref sim) = input_sim_rx {
-                let _ = sim.handle_key_event(&protocol::KeyEvent { key, action });
+                if let Err(e) = sim.handle_key_event(&protocol::KeyEvent { key, action }) {
+                    log::warn!("Key input error: {}", e);
+                }
             }
         }
         protocol::Message::TypeText { text } => {
@@ -315,28 +332,52 @@ fn spawn_quic_accept_loop(
 pub fn run() {
     let _ = env_logger::try_init();
 
+    #[cfg(target_os = "windows")]
+    unsafe {
+        #[link(name = "user32")]
+        extern "system" {
+            fn SetProcessDPIAware() -> i32;
+        }
+        SetProcessDPIAware();
+    }
+
     // Auto-configure Windows Defender Firewall inbound rule silently (zero manual setup)
     nat::ensure_windows_firewall_rule();
 
-    let mut config = AppConfig::load().unwrap_or_default();
+    let config = AppConfig::load().unwrap_or_default();
     let initial_port = if config.listen_port > 0 { config.listen_port } else { 28843 };
 
-    // Bind dedicated IPv4 QUIC socket (with STUN probe + clone for NAT keepalive & hole punching) and optional IPv6 socket
-    let mut bound_v4: Option<QuicServer> = None;
-    let mut bound_v6: Option<QuicServer> = None;
-    let mut punch_socket: Option<std::net::UdpSocket> = None;
-    let mut stun_endpoint: Option<(String, u16)> = None;
-    let mut actual_port = initial_port;
+    let (signal_url, d_id, d_code, d_name, auth_token_cfg) = (
+        config.signal_server_url.clone(),
+        config.device_id.clone(),
+        config.device_code.clone(),
+        config.device_name.clone(),
+        config.auth_token.clone(),
+    );
 
-    let signal_url_init = config.signal_server_url.clone();
+    let app_state = AppState::new(config);
 
-    tauri::async_runtime::block_on(async {
+    // Clone handles for background network startup (zero blocking on GUI launch!)
+    let bg_state_channel = app_state.active_channel.clone();
+    let bg_is_sharing = Arc::clone(&app_state.is_sharing);
+    let bg_input_sim = app_state.input_simulator.clone();
+    let bg_transfer_receivers = app_state.transfer_receivers.clone();
+    let bg_quic_server = app_state.quic_server.clone();
+    let bg_config = Arc::new(tokio::sync::Mutex::new(()));
+    let _ = bg_config;
+
+    tauri::async_runtime::spawn(async move {
+        let mut bound_v4: Option<QuicServer> = None;
+        let mut bound_v6: Option<QuicServer> = None;
+        let mut punch_socket: Option<std::net::UdpSocket> = None;
+        let mut stun_endpoint: Option<(String, u16)> = None;
+        let mut actual_port = initial_port;
+
         for offset in 0..50 {
             let try_port = initial_port.wrapping_add(offset);
             if let Ok(addr_v4) = format!("0.0.0.0:{}", try_port).parse::<SocketAddr>() {
                 if let Ok(udp_v4) = std::net::UdpSocket::bind(addr_v4) {
-                    // Probe real NAT-mapped IP:Port via STUN before Quinn takes ownership of this socket
-                    stun_endpoint = nat::probe_stun_on_socket(&udp_v4, &signal_url_init);
+                    stun_endpoint = nat::probe_stun_on_socket(&udp_v4, &signal_url);
                     punch_socket = udp_v4.try_clone().ok();
                     if let Ok(srv4) = QuicServer::bind_with_socket(udp_v4) {
                         log::info!("Bound IPv4 QUIC server on {} (STUN: {:?})", srv4.listen_addr, stun_endpoint);
@@ -350,7 +391,7 @@ pub fn run() {
 
         if bound_v4.is_none() {
             if let Ok(udp_v4) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                stun_endpoint = nat::probe_stun_on_socket(&udp_v4, &signal_url_init);
+                stun_endpoint = nat::probe_stun_on_socket(&udp_v4, &signal_url);
                 punch_socket = udp_v4.try_clone().ok();
                 if let Ok(srv4) = QuicServer::bind_with_socket(udp_v4) {
                     actual_port = srv4.listen_addr.port();
@@ -359,129 +400,101 @@ pub fn run() {
             }
         }
 
-        // Also bind IPv6 on the exact same port so IPv6 direct connections work alongside IPv4 on Windows
         if let Ok(addr_v6) = format!("[::]:{}", actual_port).parse::<SocketAddr>() {
             if let Ok(srv6) = QuicServer::bind(addr_v6) {
                 log::info!("Bound IPv6 QUIC server on {}", srv6.listen_addr);
                 bound_v6 = Some(srv6);
             }
         }
-    });
 
-    if actual_port != config.listen_port {
-        config.listen_port = actual_port;
-        let _ = config.save();
-    }
-
-    let app_state = AppState::new(config);
-
-    if let Some(srv4) = bound_v4 {
-        let srv4_arc = Arc::new(srv4);
-        *app_state.quic_server.blocking_lock() = Some(Arc::clone(&srv4_arc));
-        spawn_quic_accept_loop(
-            srv4_arc,
-            app_state.active_channel.clone(),
-            Arc::clone(&app_state.is_sharing),
-            app_state.input_simulator.clone(),
-            app_state.transfer_receivers.clone(),
-        );
-    }
-
-    if let Some(srv6) = bound_v6 {
-        let srv6_arc = Arc::new(srv6);
-        if app_state.quic_server.blocking_lock().is_none() {
-            *app_state.quic_server.blocking_lock() = Some(Arc::clone(&srv6_arc));
+        if let Some(srv4) = bound_v4 {
+            let srv4_arc = Arc::new(srv4);
+            *bg_quic_server.lock().await = Some(Arc::clone(&srv4_arc));
+            spawn_quic_accept_loop(
+                srv4_arc,
+                bg_state_channel.clone(),
+                Arc::clone(&bg_is_sharing),
+                bg_input_sim.clone(),
+                bg_transfer_receivers.clone(),
+            );
         }
-        spawn_quic_accept_loop(
-            srv6_arc,
-            app_state.active_channel.clone(),
-            Arc::clone(&app_state.is_sharing),
-            app_state.input_simulator.clone(),
-            app_state.transfer_receivers.clone(),
-        );
-    }
 
-    // Background continuous heartbeat registration + UPnP auto port mapping + NAT keepalive + UDP hole punch responder
-    let (signal_url, d_id, d_code, d_name, l_port, auth_token_cfg) = {
-        let cfg = app_state.config.blocking_lock();
-        (
-            cfg.signal_server_url.clone(),
-            cfg.device_id.clone(),
-            cfg.device_code.clone(),
-            cfg.device_name.clone(),
-            cfg.listen_port,
-            cfg.auth_token.clone(),
-        )
-    };
-
-    // Auto UPnP router port mapping on startup
-    let upnp_ip = crate::signaling::detect_best_local_ip();
-    tauri::async_runtime::spawn(async move {
-        let _ = nat::try_upnp_port_mapping(&upnp_ip, l_port).await;
-    });
-
-    // Periodic signaling registration with true STUN public IP:Port
-    let signal_url_clone = signal_url.clone();
-    let d_code_clone = d_code.clone();
-    let stun_clone = stun_endpoint.clone();
-    tauri::async_runtime::spawn(async move {
-        let (s_ip, s_port) = match stun_clone {
-            Some((ip, port)) => (Some(ip), Some(port)),
-            None => (None, None),
-        };
-        loop {
-            let l_ip = crate::signaling::detect_best_local_ip();
-            let v6 = crate::signaling::detect_public_ipv6();
-            let _ = crate::signaling::register_to_signaling_with_stun(
-                &signal_url_clone,
-                &d_id,
-                &d_code_clone,
-                &d_name,
-                &l_ip,
-                l_port,
-                v6,
-                s_ip.as_deref(),
-                s_port,
-                auth_token_cfg.as_deref(),
-            )
-            .await;
-            tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+        if let Some(srv6) = bound_v6 {
+            let srv6_arc = Arc::new(srv6);
+            if bg_quic_server.lock().await.is_none() {
+                *bg_quic_server.lock().await = Some(Arc::clone(&srv6_arc));
+            }
+            spawn_quic_accept_loop(
+                srv6_arc,
+                bg_state_channel.clone(),
+                Arc::clone(&bg_is_sharing),
+                bg_input_sim.clone(),
+                bg_transfer_receivers.clone(),
+            );
         }
-    });
 
-    // Background NAT keepalive (15s) and coordinated UDP hole punching responder (1.5s poll)
-    if let Some(punch_sock) = punch_socket {
-        let signal_url_punch = signal_url.clone();
-        let d_code_punch = d_code.clone();
-        let stun_addr_opt = nat::parse_stun_addr(&signal_url);
-        tauri::async_runtime::spawn(async move {
-            let mut tick = 0u32;
+        // Auto UPnP router port mapping
+        let upnp_ip = crate::signaling::detect_best_local_ip();
+        tokio::spawn(async move {
+            let _ = nat::try_upnp_port_mapping(&upnp_ip, actual_port).await;
+        });
+
+        // Periodic signaling registration with true STUN public IP:Port
+        let signal_url_clone = signal_url.clone();
+        let d_code_clone = d_code.clone();
+        let stun_clone = stun_endpoint.clone();
+        tokio::spawn(async move {
+            let (s_ip, s_port) = match stun_clone {
+                Some((ip, port)) => (Some(ip), Some(port)),
+                None => (None, None),
+            };
             loop {
-                if tick % 10 == 0 {
-                    if let Some(stun_addr) = stun_addr_opt {
-                        let _ = punch_sock.send_to(b"KEEPALIVE", stun_addr);
-                    }
-                }
-                let targets = crate::signaling::poll_udp_punches(&signal_url_punch, &d_code_punch).await;
-                for ctrl_addr in targets {
-                    log::info!("Received coordinated UDP hole-punch request -> punching {}", ctrl_addr);
-                    for _ in 0..5 {
-                        let _ = punch_sock.send_to(b"OPRM_PUNCH", ctrl_addr);
-                    }
-                }
-                tick = tick.wrapping_add(1);
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                let l_ip = crate::signaling::detect_best_local_ip();
+                let v6 = crate::signaling::detect_public_ipv6();
+                let _ = crate::signaling::register_to_signaling_with_stun(
+                    &signal_url_clone,
+                    &d_id,
+                    &d_code_clone,
+                    &d_name,
+                    &l_ip,
+                    actual_port,
+                    v6,
+                    s_ip.as_deref(),
+                    s_port,
+                    auth_token_cfg.as_deref(),
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(25)).await;
             }
         });
-    }
 
-    // Background continuous TCP Relay listener on dxcool.cn:28845
-    let relay_channel = app_state.active_channel.clone();
-    let relay_is_sharing = Arc::clone(&app_state.is_sharing);
-    let relay_input_sim = app_state.input_simulator.clone();
-    let relay_transfer_receivers = app_state.transfer_receivers.clone();
+        // Background NAT keepalive (15s) and coordinated UDP hole punching responder (1.5s poll)
+        if let Some(punch_sock) = punch_socket {
+            let signal_url_punch = signal_url.clone();
+            let d_code_punch = d_code.clone();
+            let stun_addr_opt = nat::parse_stun_addr(&signal_url);
+            tokio::spawn(async move {
+                let mut tick = 0u32;
+                loop {
+                    if tick % 10 == 0 {
+                        if let Some(stun_addr) = stun_addr_opt {
+                            let _ = punch_sock.send_to(b"KEEPALIVE", stun_addr);
+                        }
+                    }
+                    let targets = crate::signaling::poll_udp_punches(&signal_url_punch, &d_code_punch).await;
+                    for ctrl_addr in targets {
+                        log::info!("Received coordinated UDP hole-punch request -> punching {}", ctrl_addr);
+                        for _ in 0..5 {
+                            let _ = punch_sock.send_to(b"OPRM_PUNCH", ctrl_addr);
+                        }
+                    }
+                    tick = tick.wrapping_add(1);
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                }
+            });
+        }
 
-    tauri::async_runtime::spawn(async move {
+        // Background continuous TCP Relay listener on dxcool.cn:28845
         let relay_addr = crate::signaling::parse_relay_address(&signal_url);
         loop {
             log::info!("Connecting to TCP Relay server at {} to stand by for remote control...", relay_addr);
@@ -494,19 +507,18 @@ pub fn run() {
                     match channel.recv().await {
                         Ok(msg) => {
                             log::info!("Controller connected via TCP Relay tunnel! Message: {:?}", msg);
-                            *relay_channel.lock().await = Some(channel.clone());
+                            *bg_state_channel.lock().await = Some(channel.clone());
 
-                            let is_sharing_stream = Arc::clone(&relay_is_sharing);
+                            let is_sharing_stream = Arc::clone(&bg_is_sharing);
                             is_sharing_stream.store(true, std::sync::atomic::Ordering::SeqCst);
 
                             let profile = StreamProfile::new(true);
                             let capture_task = spawn_screen_stream_task(
                                 channel.clone(),
-                                Arc::clone(&relay_is_sharing),
+                                Arc::clone(&bg_is_sharing),
                                 Arc::clone(&profile),
                             );
 
-                            // Start clipboard sync on host for TCP Relay session
                             let mut host_clipboard = clipboard::ClipboardMonitor::new();
                             let channel_cb = channel.clone();
                             host_clipboard.start_monitoring(move |text| {
@@ -518,9 +530,9 @@ pub fn run() {
                             });
 
                             let channel_rx = channel.clone();
-                            let input_sim_rx = relay_input_sim.lock().await.clone();
-                            let is_sharing_clone = Arc::clone(&relay_is_sharing);
-                            let transfer_receivers_rx = relay_transfer_receivers.clone();
+                            let input_sim_rx = bg_input_sim.lock().await.clone();
+                            let is_sharing_clone = Arc::clone(&bg_is_sharing);
+                            let transfer_receivers_rx = bg_transfer_receivers.clone();
 
                             loop {
                                 match channel_rx.recv().await {

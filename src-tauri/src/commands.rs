@@ -988,7 +988,7 @@ pub async fn set_stream_quality(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let (quality, max_width, fps) = match mode.as_str() {
-        "ultra" => (80u8, 0u32, 45u8),
+        "ultra" => (68u8, 0u32, 30u8),
         "speed" => (38u8, 960u32, 30u8),
         _ => (52u8, 1280u32, 30u8),
     };

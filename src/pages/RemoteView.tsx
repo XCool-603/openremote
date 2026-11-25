@@ -75,7 +75,8 @@ export const RemoteView: React.FC = () => {
     let aborted = false;
     const abortCtrl = new AbortController();
     let unlistenLatency: (() => void) | undefined;
-    let tileDrawCount = 0;
+    let frameDrawCount = 0;
+    let lastTileBatchTime = 0;
     let lastFpsTime = performance.now();
 
     // Start latency listener
@@ -153,11 +154,14 @@ export const RemoteView: React.FC = () => {
                     bitmap.close();
                     setHasReceivedFrame(true);
 
-                    tileDrawCount++;
                     const now = performance.now();
+                    if (now - lastTileBatchTime >= 12) {
+                      frameDrawCount++;
+                      lastTileBatchTime = now;
+                    }
                     if (now - lastFpsTime >= 1000) {
-                      setFps(Math.min(60, Math.max(1, Math.round((tileDrawCount * 1000) / (now - lastFpsTime)))));
-                      tileDrawCount = 0;
+                      setFps(Math.min(60, Math.max(1, Math.round((frameDrawCount * 1000) / (now - lastFpsTime)))));
+                      frameDrawCount = 0;
                       lastFpsTime = now;
                     }
                   })

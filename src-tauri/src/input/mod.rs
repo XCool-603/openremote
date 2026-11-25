@@ -18,6 +18,12 @@ impl InputSimulator {
         })
     }
 
+    /// Query the primary display dimensions that Enigo uses for Coordinate::Abs scaling
+    pub fn screen_size(&self) -> Option<(i32, i32)> {
+        let enigo = self.enigo.lock().unwrap();
+        enigo.main_display().ok()
+    }
+
     /// Move mouse cursor to (x, y) coordinates
     pub fn move_mouse(&self, x: i32, y: i32) -> Result<()> {
         let mut enigo = self.enigo.lock().unwrap();
