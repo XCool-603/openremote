@@ -113,9 +113,9 @@ export const Home: React.FC = () => {
     setConnecting(true);
     setStatusNotice(`正在连接到 ${name} (${address})...`);
     try {
-      const res = await safeInvoke<{ mode: string; target: string }>('connect_to_device', { address });
+      const res = await safeInvoke<{ mode: string; target: string; stream_port: number }>('connect_to_device', { address });
       saveDeviceRecord(address, name);
-      connect(address, name, res?.mode, res?.target);
+      connect(address, name, res?.mode, res?.target, res?.stream_port);
       setStatusNotice(null);
       navigate('/remote');
     } catch (err) {
@@ -137,12 +137,12 @@ export const Home: React.FC = () => {
     setConnecting(true);
     setStatusNotice(`正在连接目标设备 ${connectAddress}...`);
     try {
-      const res = await safeInvoke<{ mode: string; target: string }>('connect_to_device', {
+      const res = await safeInvoke<{ mode: string; target: string; stream_port: number }>('connect_to_device', {
         address: connectAddress,
       });
       const deviceTitle = `远程电脑 (${connectAddress})`;
       saveDeviceRecord(connectAddress, deviceTitle);
-      connect(connectAddress, deviceTitle, res?.mode, res?.target);
+      connect(connectAddress, deviceTitle, res?.mode, res?.target, res?.stream_port);
       setIsModalOpen(false);
       setStatusNotice(null);
       navigate('/remote');

@@ -7,12 +7,13 @@ interface ConnectionState {
   peerName: string | null;
   connectionMode: string | null;
   connectionTarget: string | null;
+  streamPort: number | null;
   latency: number;
   fps: number;
   deviceInfo: DeviceInfo | null;
   authUser: string | null;
   isAuthModalOpen: boolean;
-  connect: (address: string, name?: string, mode?: string, target?: string) => void;
+  connect: (address: string, name?: string, mode?: string, target?: string, streamPort?: number) => void;
   disconnect: () => void;
   setLatency: (latency: number) => void;
   setFps: (fps: number) => void;
@@ -27,18 +28,20 @@ export const useConnectionStore = create<ConnectionState>((set) => ({
   peerName: null,
   connectionMode: null,
   connectionTarget: null,
+  streamPort: null,
   latency: 0,
   fps: 0,
   deviceInfo: null,
   authUser: null,
   isAuthModalOpen: false,
-  connect: (address: string, name?: string, mode?: string, target?: string) =>
+  connect: (address: string, name?: string, mode?: string, target?: string, streamPort?: number) =>
     set({
       isConnected: true,
       peerAddress: address,
       peerName: name || address,
       connectionMode: mode || null,
       connectionTarget: target || null,
+      streamPort: streamPort || null,
     }),
   disconnect: () =>
     set({
@@ -47,6 +50,7 @@ export const useConnectionStore = create<ConnectionState>((set) => ({
       peerName: null,
       connectionMode: null,
       connectionTarget: null,
+      streamPort: null,
       latency: 0,
       fps: 0,
     }),

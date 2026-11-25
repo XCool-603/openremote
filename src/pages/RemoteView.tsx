@@ -23,6 +23,7 @@ export const RemoteView: React.FC = () => {
     peerName,
     connectionMode,
     connectionTarget,
+    streamPort,
     latency,
     fps,
     setLatency,
@@ -64,91 +65,122 @@ export const RemoteView: React.FC = () => {
 
   const [hasReceivedFrame, setHasReceivedFrame] = useState(false);
 
-  // Real screen-frame and latency listener from Tauri backend
+  // Real zero-Base64 binary tile stream & latency listener
   useEffect(() => {
     if (!isConnected) {
       setHasReceivedFrame(false);
       return;
     }
-    let unlistenFrame: (() => void) | undefined;
+
+    let aborted = false;
+    const abortCtrl = new AbortController();
     let unlistenLatency: (() => void) | undefined;
-    let frameCount = 0;
+    let tileDrawCount = 0;
     let lastFpsTime = performance.now();
-    let isDecoding = false;
-    let pendingPayload: { image: string; width: number; height: number } | null = null;
 
-    const renderFrame = (payload: { image: string; width: number; height: number }) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      isDecoding = true;
-      const img = new Image();
-      img.onload = () => {
-        if (canvas.width !== payload.width || canvas.height !== payload.height) {
-          canvas.width = payload.width;
-          canvas.height = payload.height;
-          setRemoteRes({ w: payload.width, h: payload.height });
-        }
-        ctx.drawImage(img, 0, 0, payload.width, payload.height);
-        setHasReceivedFrame(true);
-
-        frameCount++;
-        const now = performance.now();
-        if (now - lastFpsTime >= 1000) {
-          setFps(Math.round((frameCount * 1000) / (now - lastFpsTime)));
-          frameCount = 0;
-          lastFpsTime = now;
-        }
-
-        isDecoding = false;
-        if (pendingPayload) {
-          const next = pendingPayload;
-          pendingPayload = null;
-          renderFrame(next);
-        }
-      };
-      img.onerror = () => {
-        isDecoding = false;
-        pendingPayload = null;
-      };
-      img.src = payload.image;
-    };
-
+    // Start latency listener
     (async () => {
       try {
         const { listen } = await import('@tauri-apps/api/event');
-        unlistenFrame = await listen<{ image: string; width: number; height: number; timestamp: number }>(
-          'screen-frame',
-          (event) => {
-            const { image, width, height } = event.payload;
-            if (isDecoding) {
-              // Drop stale queued frames and keep only the latest frame to eliminate lag buildup
-              pendingPayload = { image, width, height };
-            } else {
-              renderFrame({ image, width, height });
-            }
-          }
-        );
         unlistenLatency = await listen<number>('connection-latency', (event) => {
           if (typeof event.payload === 'number') {
             setLatency(event.payload);
           }
         });
       } catch (err) {
-        console.warn('Real screen-frame listener error or web mode:', err);
+        console.warn('Latency listener error:', err);
       }
     })();
 
-    // Auto-focus container to capture keyboard events immediately
+    // Start binary frame stream reader from local 127.0.0.1:<streamPort>/stream
+    if (streamPort && streamPort > 0) {
+      (async () => {
+        try {
+          const response = await fetch(`http://127.0.0.1:${streamPort}/stream`, {
+            signal: abortCtrl.signal,
+          });
+          const reader = response.body?.getReader();
+          if (!reader) return;
+
+          let buffer = new Uint8Array(0);
+
+          const appendChunk = (chunk: Uint8Array) => {
+            const next = new Uint8Array(buffer.length + chunk.length);
+            next.set(buffer, 0);
+            next.set(chunk, buffer.length);
+            buffer = next;
+          };
+
+          while (!aborted) {
+            const { value, done } = await reader.read();
+            if (done || !value) break;
+            appendChunk(value);
+
+            // Parse as many complete 16-byte header + payload packets as available
+            while (buffer.length >= 16) {
+              const view = new DataView(buffer.buffer, buffer.byteOffset, 16);
+              const screenW = view.getUint16(0, true);
+              const screenH = view.getUint16(2, true);
+              const tx = view.getUint16(4, true);
+              const ty = view.getUint16(6, true);
+              const tw = view.getUint16(8, true);
+              const th = view.getUint16(10, true);
+              const payloadLen = view.getUint32(12, true);
+
+              if (buffer.length < 16 + payloadLen) {
+                break; // Wait for more bytes
+              }
+
+              const jpegBytes = buffer.slice(16, 16 + payloadLen);
+              buffer = buffer.slice(16 + payloadLen);
+
+              const canvas = canvasRef.current;
+              const ctx = canvas?.getContext('2d');
+              if (canvas && ctx && screenW > 0 && screenH > 0) {
+                const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+                createImageBitmap(blob)
+                  .then((bitmap) => {
+                    if (aborted) {
+                      bitmap.close();
+                      return;
+                    }
+                    if (canvas.width !== screenW || canvas.height !== screenH) {
+                      canvas.width = screenW;
+                      canvas.height = screenH;
+                      setRemoteRes({ w: screenW, h: screenH });
+                    }
+                    ctx.drawImage(bitmap, tx, ty, tw, th);
+                    bitmap.close();
+                    setHasReceivedFrame(true);
+
+                    tileDrawCount++;
+                    const now = performance.now();
+                    if (now - lastFpsTime >= 1000) {
+                      setFps(Math.min(60, Math.max(1, Math.round((tileDrawCount * 1000) / (now - lastFpsTime)))));
+                      tileDrawCount = 0;
+                      lastFpsTime = now;
+                    }
+                  })
+                  .catch(() => {});
+              }
+            }
+          }
+        } catch (err) {
+          if (!aborted) {
+            console.warn('Binary stream reader error:', err);
+          }
+        }
+      })();
+    }
+
     containerRef.current?.focus();
 
     return () => {
-      if (unlistenFrame) unlistenFrame();
+      aborted = true;
+      abortCtrl.abort();
       if (unlistenLatency) unlistenLatency();
     };
-  }, [isConnected, setFps, setLatency]);
+  }, [isConnected, streamPort, setFps, setLatency]);
 
   // Compute exact remote desktop coordinates accounting for object-contain letterboxing
   const mapCanvasCoords = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {

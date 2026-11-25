@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{Emitter, State};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
-use base64::Engine;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
@@ -39,6 +39,8 @@ pub struct AppState {
     pub transfer_senders: Mutex<HashMap<String, Arc<Mutex<FileTransferSender>>>>,
     pub transfer_progresses: Arc<Mutex<HashMap<String, TransferProgress>>>,
     pub transfer_receivers: Arc<Mutex<HashMap<String, crate::file_transfer::FileTransferReceiver>>>,
+    pub frame_tx: tokio::sync::broadcast::Sender<Vec<u8>>,
+    pub stream_port: u16,
 }
 
 pub fn get_default_download_dir() -> std::path::PathBuf {
@@ -94,9 +96,71 @@ pub async fn handle_file_chunk(
     }
 }
 
+fn pack_binary_tile(screen_w: u16, screen_h: u16, x: u16, y: u16, w: u16, h: u16, data: &[u8]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(16 + data.len());
+    pkt.extend_from_slice(&screen_w.to_le_bytes());
+    pkt.extend_from_slice(&screen_h.to_le_bytes());
+    pkt.extend_from_slice(&x.to_le_bytes());
+    pkt.extend_from_slice(&y.to_le_bytes());
+    pkt.extend_from_slice(&w.to_le_bytes());
+    pkt.extend_from_slice(&h.to_le_bytes());
+    pkt.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    pkt.extend_from_slice(data);
+    pkt
+}
+
+fn start_local_binary_stream_server(frame_tx: tokio::sync::broadcast::Sender<Vec<u8>>) -> u16 {
+    let std_listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("Failed to bind local binary stream server: {}", e);
+            return 0;
+        }
+    };
+    let port = std_listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let _ = std_listener.set_nonblocking(true);
+
+    tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        log::info!("Local zero-copy binary frame stream listening on 127.0.0.1:{}", port);
+        loop {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock.set_nodelay(true);
+                let mut rx = frame_tx.subscribe();
+                tokio::spawn(async move {
+                    let mut req_buf = [0u8; 1024];
+                    let _ = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut req_buf)).await;
+                    let header = b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+                    if sock.write_all(header).await.is_err() {
+                        return;
+                    }
+                    loop {
+                        match rx.recv().await {
+                            Ok(pkt) => {
+                                if sock.write_all(&pkt).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    port
+}
+
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let input_sim = InputSimulator::new().ok().map(Arc::new);
+        let (frame_tx, _) = tokio::sync::broadcast::channel(128);
+        let stream_port = start_local_binary_stream_server(frame_tx.clone());
 
         Self {
             config: Mutex::new(config),
@@ -108,6 +172,8 @@ impl AppState {
             transfer_senders: Mutex::new(HashMap::new()),
             transfer_progresses: Arc::new(Mutex::new(HashMap::new())),
             transfer_receivers: Arc::new(Mutex::new(HashMap::new())),
+            frame_tx,
+            stream_port,
         }
     }
 }
@@ -226,6 +292,7 @@ pub async fn stop_screen_sharing(state: State<'_, AppState>) -> Result<(), Strin
 pub struct ConnectionResult {
     pub mode: String,
     pub target: String,
+    pub stream_port: u16,
 }
 
 fn classify_quic_mode(addr: &SocketAddr) -> String {
@@ -455,26 +522,47 @@ pub async fn connect_to_device(
     // Spawn receiver task for incoming messages (e.g. screen frames or clipboard or file reception)
     let app_handle_clone = app_handle.clone();
     let receivers_clone = Arc::clone(&state.transfer_receivers);
+    let frame_tx_clone = state.frame_tx.clone();
+    let stream_port = state.stream_port;
     tokio::spawn(async move {
         loop {
             match channel.recv().await {
                 Ok(msg) => match msg {
+                    Message::TileFrames {
+                        screen_w,
+                        screen_h,
+                        tiles,
+                        ..
+                    } => {
+                        for tile in tiles {
+                            let pkt = pack_binary_tile(
+                                screen_w,
+                                screen_h,
+                                tile.x,
+                                tile.y,
+                                tile.w,
+                                tile.h,
+                                &tile.data,
+                            );
+                            let _ = frame_tx_clone.send(pkt);
+                        }
+                    }
                     Message::ScreenFrame {
                         data,
                         width,
                         height,
-                        timestamp,
+                        ..
                     } => {
-                        let base64_str = base64::engine::general_purpose::STANDARD.encode(&data);
-                        let _ = app_handle_clone.emit(
-                            "screen-frame",
-                            serde_json::json!({
-                                "image": format!("data:image/jpeg;base64,{}", base64_str),
-                                "width": width,
-                                "height": height,
-                                "timestamp": timestamp,
-                            }),
+                        let pkt = pack_binary_tile(
+                            width as u16,
+                            height as u16,
+                            0,
+                            0,
+                            width as u16,
+                            height as u16,
+                            &data,
                         );
+                        let _ = frame_tx_clone.send(pkt);
                     }
                     Message::FileTransferStart {
                         id,
@@ -516,6 +604,7 @@ pub async fn connect_to_device(
     Ok(ConnectionResult {
         mode: connected_mode,
         target: connected_target,
+        stream_port,
     })
 }
 

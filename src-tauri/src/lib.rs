@@ -31,10 +31,10 @@ struct StreamProfile {
 impl StreamProfile {
     fn new(is_relay: bool) -> Arc<Self> {
         Arc::new(Self {
-            // Relay defaults to low-latency 18FPS (1024px, Q45) to prevent TCP bufferbloat; direct QUIC defaults to high quality
-            quality: std::sync::atomic::AtomicU8::new(if is_relay { 45 } else { 70 }),
-            max_width: std::sync::atomic::AtomicU32::new(if is_relay { 1024 } else { 1920 }),
-            fps: std::sync::atomic::AtomicU8::new(if is_relay { 18 } else { 30 }),
+            // Dirty-tile delta streaming allows crisp 1280px @ 30FPS even over relay
+            quality: std::sync::atomic::AtomicU8::new(if is_relay { 55 } else { 75 }),
+            max_width: std::sync::atomic::AtomicU32::new(if is_relay { 1280 } else { 1920 }),
+            fps: std::sync::atomic::AtomicU8::new(30),
             native_w: std::sync::atomic::AtomicU32::new(0),
             native_h: std::sync::atomic::AtomicU32::new(0),
             stream_w: std::sync::atomic::AtomicU32::new(0),
@@ -183,7 +183,8 @@ fn spawn_screen_stream_task(
                 }
             };
 
-            log::info!("Screen capturer successfully initialized!");
+            log::info!("Screen capturer successfully initialized! Using dirty-tile delta streaming.");
+            let mut is_first_frame = true;
 
             while is_sharing_stream.load(std::sync::atomic::Ordering::SeqCst) {
                 let start = std::time::Instant::now();
@@ -191,41 +192,33 @@ fn spawn_screen_stream_task(
                 let cur_max_width = profile.max_width.load(std::sync::atomic::Ordering::Relaxed);
                 let cur_fps = profile.fps.load(std::sync::atomic::Ordering::Relaxed).max(1) as u64;
 
-                let encoder = codec::FrameEncoder::new(cur_quality);
+                match capturer.capture_dirty_tiles(cur_max_width, cur_quality, is_first_frame) {
+                    Ok(batch) => {
+                        is_first_frame = false;
+                        profile.native_w.store(batch.native_w, std::sync::atomic::Ordering::Relaxed);
+                        profile.native_h.store(batch.native_h, std::sync::atomic::Ordering::Relaxed);
+                        if batch.out_w > 0 && batch.out_h > 0 {
+                            profile.stream_w.store(batch.out_w as u32, std::sync::atomic::Ordering::Relaxed);
+                            profile.stream_h.store(batch.out_h as u32, std::sync::atomic::Ordering::Relaxed);
+                        }
 
-                match capturer.capture_frame() {
-                    Ok(frame) => {
-                        profile.native_w.store(frame.width, std::sync::atomic::Ordering::Relaxed);
-                        profile.native_h.store(frame.height, std::sync::atomic::Ordering::Relaxed);
-
-                        if frame.is_dirty {
-                            if let Ok((jpeg, out_w, out_h)) = encoder.encode_scaled(
-                                frame.width,
-                                frame.height,
-                                &frame.data,
-                                cur_max_width,
-                            ) {
-                                profile.stream_w.store(out_w, std::sync::atomic::Ordering::Relaxed);
-                                profile.stream_h.store(out_h, std::sync::atomic::Ordering::Relaxed);
-
-                                let msg = protocol::Message::ScreenFrame {
-                                    data: jpeg,
-                                    width: out_w,
-                                    height: out_h,
-                                    timestamp: chrono::Utc::now().timestamp_millis(),
-                                };
-                                let send_start = std::time::Instant::now();
-                                if let Err(e) = stream_channel.send(&msg).await {
-                                    log::info!("Stream channel closed: {}", e);
-                                    is_sharing_stream.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    return;
-                                }
-                                let send_dur = send_start.elapsed();
-                                if send_dur > std::time::Duration::from_millis(80) {
-                                    // Backpressure detected: pause briefly so TCP send buffer drains instead of queueing seconds of frames
-                                    let drain_ms = (send_dur.as_millis() as u64).min(300);
-                                    tokio::time::sleep(std::time::Duration::from_millis(drain_ms)).await;
-                                }
+                        if !batch.tiles.is_empty() {
+                            let msg = protocol::Message::TileFrames {
+                                screen_w: batch.out_w,
+                                screen_h: batch.out_h,
+                                tiles: batch.tiles,
+                                timestamp: chrono::Utc::now().timestamp_millis(),
+                            };
+                            let send_start = std::time::Instant::now();
+                            if let Err(e) = stream_channel.send(&msg).await {
+                                log::info!("Stream channel closed: {}", e);
+                                is_sharing_stream.store(false, std::sync::atomic::Ordering::SeqCst);
+                                return;
+                            }
+                            let send_dur = send_start.elapsed();
+                            if send_dur > std::time::Duration::from_millis(80) {
+                                let drain_ms = (send_dur.as_millis() as u64).min(250);
+                                tokio::time::sleep(std::time::Duration::from_millis(drain_ms)).await;
                             }
                         }
                     }

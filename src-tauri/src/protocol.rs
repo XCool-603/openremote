@@ -100,6 +100,16 @@ pub struct KeyEvent {
     pub action: KeyAction,
 }
 
+/// Single changed rectangular tile encoded as JPEG
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirtyTile {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    pub data: Vec<u8>,
+}
+
 /// Core protocol messages exchanged between OpenRemote clients & host
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
@@ -169,5 +179,12 @@ pub enum Message {
         quality: u8,
         max_width: u32,
         fps: u8,
+    },
+    /// High-efficiency incremental dirty-tile frame batch
+    TileFrames {
+        screen_w: u16,
+        screen_h: u16,
+        tiles: Vec<DirtyTile>,
+        timestamp: i64,
     },
 }
