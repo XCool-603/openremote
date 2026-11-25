@@ -222,13 +222,33 @@ pub async fn stop_screen_sharing(state: State<'_, AppState>) -> Result<(), Strin
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionResult {
+    pub mode: String,
+    pub target: String,
+}
+
+fn classify_quic_mode(addr: &SocketAddr) -> String {
+    match addr {
+        SocketAddr::V6(_) => "IPv6".to_string(),
+        SocketAddr::V4(v4) => {
+            let ip = v4.ip();
+            if ip.is_loopback() || ip.is_private() || ip.is_link_local() {
+                "LAN".to_string()
+            } else {
+                "P2P".to_string()
+            }
+        }
+    }
+}
+
 /// Connect to a remote OpenRemote peer via QUIC (supports device code or direct IP:port)
 #[tauri::command]
 pub async fn connect_to_device(
     address: String,
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<(), String> {
+) -> Result<ConnectionResult, String> {
     let target_addrs: Vec<SocketAddr> = if crate::signaling::is_device_code(&address) {
         let signal_url = {
             let config = state.config.lock().await;
@@ -266,6 +286,8 @@ pub async fn connect_to_device(
     // Try connecting to candidate addresses sequentially (local LAN first, then public IPv6, then NAT reflexive)
     let mut last_err = String::new();
     let mut connected_channel = None;
+    let mut connected_mode = String::new();
+    let mut connected_target = String::new();
 
     for target_addr in target_addrs {
         log::info!("Attempting QUIC peer connection to candidate {}", target_addr);
@@ -281,6 +303,8 @@ pub async fn connect_to_device(
         match tokio::time::timeout(std::time::Duration::from_millis(1200), connect_fut).await {
             Ok(Ok(chan)) => {
                 log::info!("Successfully connected to candidate {}", target_addr);
+                connected_mode = classify_quic_mode(&target_addr);
+                connected_target = target_addr.to_string();
                 connected_channel = Some(chan);
                 break;
             }
@@ -320,6 +344,8 @@ pub async fn connect_to_device(
                 {
                     Ok(tcp_stream) => {
                         log::info!("Successfully established TCP Relay tunnel to {}", address);
+                        connected_mode = "Relay".to_string();
+                        connected_target = relay_addr;
                         ConnectionChannel::new_tcp(tcp_stream)
                     }
                     Err(e) => {
@@ -365,6 +391,18 @@ pub async fn connect_to_device(
         });
     });
     *state.clipboard_monitor.lock().await = Some(ctrl_clipboard);
+
+    // Spawn real-time Ping RTT measurement task (every 2 seconds)
+    let ping_channel = channel.clone();
+    let ping_task = tokio::spawn(async move {
+        loop {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            if ping_channel.send(&Message::Ping { timestamp: now_ms }).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
 
     // Spawn receiver task for incoming messages (e.g. screen frames or clipboard or file reception)
     let app_handle_clone = app_handle.clone();
@@ -412,6 +450,10 @@ pub async fn connect_to_device(
                     Message::Ping { timestamp } => {
                         let _ = channel.send(&Message::Pong { timestamp }).await;
                     }
+                    Message::Pong { timestamp } => {
+                        let rtt = (chrono::Utc::now().timestamp_millis() - timestamp).max(1);
+                        let _ = app_handle_clone.emit("connection-latency", rtt);
+                    }
                     _ => {}
                 },
                 Err(e) => {
@@ -420,9 +462,13 @@ pub async fn connect_to_device(
                 }
             }
         }
+        ping_task.abort();
     });
 
-    Ok(())
+    Ok(ConnectionResult {
+        mode: connected_mode,
+        target: connected_target,
+    })
 }
 
 /// Send mouse input event to remote peer
@@ -796,6 +842,31 @@ pub async fn register_account(
         username: Some(user),
         token: Some(token),
     })
+}
+
+/// Dynamically adjust remote stream quality mode ("ultra", "balanced", "speed")
+#[tauri::command]
+pub async fn set_stream_quality(
+    mode: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (quality, max_width, fps) = match mode.as_str() {
+        "ultra" => (80u8, 0u32, 45u8),
+        "speed" => (38u8, 960u32, 30u8),
+        _ => (52u8, 1280u32, 30u8),
+    };
+
+    if let Some(ref channel) = *state.active_channel.lock().await {
+        channel
+            .send(&Message::QualityConfig {
+                quality,
+                max_width,
+                fps,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Logout current account

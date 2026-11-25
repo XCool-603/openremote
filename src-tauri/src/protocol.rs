@@ -164,4 +164,10 @@ pub enum Message {
         success: bool,
         message: Option<String>,
     },
+    /// Dynamically adjust stream quality and max resolution
+    QualityConfig {
+        quality: u8,
+        max_width: u32,
+        fps: u8,
+    },
 }

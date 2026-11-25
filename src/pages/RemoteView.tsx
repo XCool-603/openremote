@@ -17,8 +17,18 @@ export const RemoteView: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  const { isConnected, peerAddress, peerName, latency, fps, setLatency, setFps, disconnect } =
-    useConnectionStore();
+  const {
+    isConnected,
+    peerAddress,
+    peerName,
+    connectionMode,
+    connectionTarget,
+    latency,
+    fps,
+    setLatency,
+    setFps,
+    disconnect,
+  } = useConnectionStore();
 
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [quality, setQuality] = useState<'ultra' | 'balanced' | 'speed'>('balanced');
@@ -54,50 +64,78 @@ export const RemoteView: React.FC = () => {
 
   const [hasReceivedFrame, setHasReceivedFrame] = useState(false);
 
-  // Real screen-frame listener from Tauri backend
+  // Real screen-frame and latency listener from Tauri backend
   useEffect(() => {
     if (!isConnected) {
       setHasReceivedFrame(false);
       return;
     }
-    let unlisten: (() => void) | undefined;
+    let unlistenFrame: (() => void) | undefined;
+    let unlistenLatency: (() => void) | undefined;
     let frameCount = 0;
     let lastFpsTime = performance.now();
+    let isDecoding = false;
+    let pendingPayload: { image: string; width: number; height: number } | null = null;
+
+    const renderFrame = (payload: { image: string; width: number; height: number }) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      isDecoding = true;
+      const img = new Image();
+      img.onload = () => {
+        if (canvas.width !== payload.width || canvas.height !== payload.height) {
+          canvas.width = payload.width;
+          canvas.height = payload.height;
+          setRemoteRes({ w: payload.width, h: payload.height });
+        }
+        ctx.drawImage(img, 0, 0, payload.width, payload.height);
+        setHasReceivedFrame(true);
+
+        frameCount++;
+        const now = performance.now();
+        if (now - lastFpsTime >= 1000) {
+          setFps(Math.round((frameCount * 1000) / (now - lastFpsTime)));
+          frameCount = 0;
+          lastFpsTime = now;
+        }
+
+        isDecoding = false;
+        if (pendingPayload) {
+          const next = pendingPayload;
+          pendingPayload = null;
+          renderFrame(next);
+        }
+      };
+      img.onerror = () => {
+        isDecoding = false;
+        pendingPayload = null;
+      };
+      img.src = payload.image;
+    };
 
     (async () => {
       try {
         const { listen } = await import('@tauri-apps/api/event');
-        unlisten = await listen<{ image: string; width: number; height: number; timestamp: number }>(
+        unlistenFrame = await listen<{ image: string; width: number; height: number; timestamp: number }>(
           'screen-frame',
           (event) => {
-            const { image, timestamp, width, height } = event.payload;
-            const canvas = canvasRef.current;
-            if (!canvas) return;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) return;
-
-            const img = new Image();
-            img.onload = () => {
-              if (canvas.width !== width || canvas.height !== height) {
-                canvas.width = width;
-                canvas.height = height;
-                setRemoteRes({ w: width, h: height });
-              }
-              ctx.drawImage(img, 0, 0, width, height);
-              setHasReceivedFrame(true);
-
-              frameCount++;
-              const now = performance.now();
-              if (now - lastFpsTime >= 1000) {
-                setFps(Math.round((frameCount * 1000) / (now - lastFpsTime)));
-                frameCount = 0;
-                lastFpsTime = now;
-              }
-              setLatency(Math.max(1, Date.now() - timestamp));
-            };
-            img.src = image;
+            const { image, width, height } = event.payload;
+            if (isDecoding) {
+              // Drop stale queued frames and keep only the latest frame to eliminate lag buildup
+              pendingPayload = { image, width, height };
+            } else {
+              renderFrame({ image, width, height });
+            }
           }
         );
+        unlistenLatency = await listen<number>('connection-latency', (event) => {
+          if (typeof event.payload === 'number') {
+            setLatency(event.payload);
+          }
+        });
       } catch (err) {
         console.warn('Real screen-frame listener error or web mode:', err);
       }
@@ -107,7 +145,8 @@ export const RemoteView: React.FC = () => {
     containerRef.current?.focus();
 
     return () => {
-      if (unlisten) unlisten();
+      if (unlistenFrame) unlistenFrame();
+      if (unlistenLatency) unlistenLatency();
     };
   }, [isConnected, setFps, setLatency]);
 
@@ -292,13 +331,34 @@ export const RemoteView: React.FC = () => {
           </div>
 
           {isConnected && (
-            <div className="hidden sm:flex items-center gap-3 text-xs bg-surface-dark/80 px-2.5 py-1 rounded-md border border-surface-lighter font-mono text-zinc-300">
-              <span className="flex items-center gap-1 text-primary-light">
+            <div className="hidden sm:flex items-center gap-2.5 text-xs bg-surface-dark/80 px-2.5 py-1 rounded-md border border-surface-lighter font-mono text-zinc-300">
+              {connectionMode && (
+                <>
+                  <span
+                    title={`传输通道: ${connectionTarget || connectionMode}`}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                      connectionMode === 'Relay'
+                        ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                        : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                    }`}
+                  >
+                    {connectionMode === 'IPv6'
+                      ? 'IPv6 直连'
+                      : connectionMode === 'LAN'
+                      ? '局域网直连'
+                      : connectionMode === 'P2P'
+                      ? 'P2P 打洞直连'
+                      : '云端中继'}
+                  </span>
+                  <span className="text-zinc-600">|</span>
+                </>
+              )}
+              <span className="flex items-center gap-1 text-primary-light" title="真实网络往返延迟 (Ping/Pong RTT)">
                 <Activity className="w-3 h-3" />
-                {latency || 9} ms
+                {latency > 0 ? `${latency} ms` : '测速中'}
               </span>
               <span className="text-zinc-500">|</span>
-              <span className="text-emerald-400">{fps || 60} FPS</span>
+              <span className="text-emerald-400">{fps || 0} FPS</span>
               <span className="text-zinc-500">|</span>
               <span className="text-zinc-400">{remoteRes.w}x{remoteRes.h}</span>
             </div>
@@ -366,39 +426,42 @@ export const RemoteView: React.FC = () => {
                       onClick={() => {
                         setQuality('ultra');
                         setShowSettingsDropdown(false);
-                        showToast('已切换画质模式: 超清原画');
+                        safeInvoke('set_stream_quality', { mode: 'ultra' }).catch(() => {});
+                        showToast('已切换画质模式: 超清原画 (45FPS)');
                       }}
                       className={`w-full text-left px-2.5 py-1.5 rounded-lg transition-colors ${
                         quality === 'ultra' ? 'bg-primary text-white font-medium' : 'text-zinc-300 hover:bg-surface-light'
                       }`}
                     >
-                      超清画质 (原画 4K/60)
+                      超清画质 (原画 高清)
                     </button>
                     <button
                       type="button"
                       onClick={() => {
                         setQuality('balanced');
                         setShowSettingsDropdown(false);
-                        showToast('已切换画质模式: 平衡流畅');
+                        safeInvoke('set_stream_quality', { mode: 'balanced' }).catch(() => {});
+                        showToast('已切换画质模式: 平衡流畅 (720P)');
                       }}
                       className={`w-full text-left px-2.5 py-1.5 rounded-lg transition-colors ${
                         quality === 'balanced' ? 'bg-primary text-white font-medium' : 'text-zinc-300 hover:bg-surface-light'
                       }`}
                     >
-                      平衡流畅 (推荐 1080P)
+                      平衡流畅 (推荐 720P)
                     </button>
                     <button
                       type="button"
                       onClick={() => {
                         setQuality('speed');
                         setShowSettingsDropdown(false);
-                        showToast('已切换画质模式: 极速低延迟');
+                        safeInvoke('set_stream_quality', { mode: 'speed' }).catch(() => {});
+                        showToast('已切换画质模式: 极速低延迟 (960px)');
                       }}
                       className={`w-full text-left px-2.5 py-1.5 rounded-lg transition-colors ${
                         quality === 'speed' ? 'bg-primary text-white font-medium' : 'text-zinc-300 hover:bg-surface-light'
                       }`}
                     >
-                      极速竞技 (超低延迟 120Hz)
+                      极速竞技 (超低带宽低延迟)
                     </button>
                   </div>
                 )}

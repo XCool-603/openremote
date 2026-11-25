@@ -17,12 +17,144 @@ use std::sync::Arc;
 use tauri::Manager;
 use transport::QuicServer;
 
+struct StreamProfile {
+    quality: std::sync::atomic::AtomicU8,
+    max_width: std::sync::atomic::AtomicU32,
+    fps: std::sync::atomic::AtomicU8,
+    native_w: std::sync::atomic::AtomicU32,
+    native_h: std::sync::atomic::AtomicU32,
+    stream_w: std::sync::atomic::AtomicU32,
+    stream_h: std::sync::atomic::AtomicU32,
+}
+
+impl StreamProfile {
+    fn new(is_relay: bool) -> Arc<Self> {
+        Arc::new(Self {
+            // Relay defaults to balanced low-latency (1280px, Q50); direct QUIC defaults to high quality (1920px, Q70)
+            quality: std::sync::atomic::AtomicU8::new(if is_relay { 50 } else { 70 }),
+            max_width: std::sync::atomic::AtomicU32::new(if is_relay { 1280 } else { 1920 }),
+            fps: std::sync::atomic::AtomicU8::new(30),
+            native_w: std::sync::atomic::AtomicU32::new(0),
+            native_h: std::sync::atomic::AtomicU32::new(0),
+            stream_w: std::sync::atomic::AtomicU32::new(0),
+            stream_h: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+
+    fn update(&self, quality: u8, max_width: u32, fps: u8) {
+        self.quality.store(quality.clamp(20, 95), std::sync::atomic::Ordering::Relaxed);
+        self.max_width.store(max_width, std::sync::atomic::Ordering::Relaxed);
+        self.fps.store(fps.clamp(10, 60), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn map_coords(&self, x: i32, y: i32) -> (i32, i32) {
+        let nw = self.native_w.load(std::sync::atomic::Ordering::Relaxed) as i64;
+        let nh = self.native_h.load(std::sync::atomic::Ordering::Relaxed) as i64;
+        let sw = self.stream_w.load(std::sync::atomic::Ordering::Relaxed) as i64;
+        let sh = self.stream_h.load(std::sync::atomic::Ordering::Relaxed) as i64;
+        if nw > 0 && nh > 0 && sw > 0 && sh > 0 && (nw != sw || nh != sh) {
+            let mx = ((x as i64 * nw) / sw).clamp(0, nw - 1) as i32;
+            let my = ((y as i64 * nh) / sh).clamp(0, nh - 1) as i32;
+            (mx, my)
+        } else {
+            (x, y)
+        }
+    }
+}
+
+async fn handle_host_incoming_message(
+    msg: protocol::Message,
+    channel_rx: &transport::ConnectionChannel,
+    input_sim_rx: &Option<Arc<input::InputSimulator>>,
+    transfer_receivers_rx: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, file_transfer::FileTransferReceiver>>>,
+    profile: &Arc<StreamProfile>,
+) {
+    match msg {
+        protocol::Message::MouseEvent {
+            x,
+            y,
+            button,
+            action,
+            delta_x,
+            delta_y,
+        } => {
+            if let Some(ref sim) = input_sim_rx {
+                let (mx, my) = profile.map_coords(x, y);
+                let _ = sim.handle_mouse_event(&protocol::MouseEvent {
+                    x: mx,
+                    y: my,
+                    button,
+                    action,
+                    delta_x,
+                    delta_y,
+                });
+            }
+        }
+        protocol::Message::KeyEvent { key, action } => {
+            if let Some(ref sim) = input_sim_rx {
+                let _ = sim.handle_key_event(&protocol::KeyEvent { key, action });
+            }
+        }
+        protocol::Message::TypeText { text } => {
+            if let Some(ref sim) = input_sim_rx {
+                let _ = sim.type_text(&text);
+            }
+        }
+        protocol::Message::ClipboardUpdate { content } => {
+            let _ = clipboard::ClipboardMonitor::set_text_silent(&content).await;
+        }
+        protocol::Message::FileTransferStart {
+            id,
+            filename,
+            total_bytes,
+            file_hash,
+        } => {
+            commands::handle_file_start(
+                id,
+                filename,
+                total_bytes,
+                file_hash,
+                transfer_receivers_rx.clone(),
+            )
+            .await;
+        }
+        protocol::Message::FileChunk {
+            id,
+            offset,
+            data,
+            is_last,
+        } => {
+            commands::handle_file_chunk(
+                id,
+                offset,
+                data,
+                is_last,
+                transfer_receivers_rx.clone(),
+            )
+            .await;
+        }
+        protocol::Message::Ping { timestamp } => {
+            let _ = channel_rx.send(&protocol::Message::Pong { timestamp }).await;
+        }
+        protocol::Message::QualityConfig {
+            quality,
+            max_width,
+            fps,
+        } => {
+            log::info!("Applying dynamic stream profile: quality={}, max_width={}, fps={}", quality, max_width, fps);
+            profile.update(quality, max_width, fps);
+        }
+        _ => {}
+    }
+}
+
 fn spawn_screen_stream_task(
     stream_channel: transport::ConnectionChannel,
     is_sharing_stream: Arc<std::sync::atomic::AtomicBool>,
+    profile: Arc<StreamProfile>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        log::info!("Starting screen streaming pipeline...");
+        log::info!("Starting adaptive screen streaming pipeline...");
 
         while is_sharing_stream.load(std::sync::atomic::Ordering::SeqCst) {
             let capturer_res = capture::create_capturer();
@@ -32,7 +164,7 @@ fn spawn_screen_stream_task(
                     log::warn!("Screen capturer standby (temporary desktop unavailable: {}). Sending keepalive frame...", e);
                     let (w, h) = (1280u32, 720u32);
                     let standby_rgb = vec![32u8; (w * h * 3) as usize];
-                    let encoder = codec::FrameEncoder::new(50);
+                    let encoder = codec::FrameEncoder::new(45);
                     if let Ok(jpeg) = encoder.encode(w, h, &standby_rgb) {
                         let msg = protocol::Message::ScreenFrame {
                             data: jpeg,
@@ -50,19 +182,35 @@ fn spawn_screen_stream_task(
                 }
             };
 
-            log::info!("Screen capturer successfully initialized! Pushing 30FPS stream...");
-            let encoder = codec::FrameEncoder::new(70);
+            log::info!("Screen capturer successfully initialized!");
 
             while is_sharing_stream.load(std::sync::atomic::Ordering::SeqCst) {
                 let start = std::time::Instant::now();
+                let cur_quality = profile.quality.load(std::sync::atomic::Ordering::Relaxed);
+                let cur_max_width = profile.max_width.load(std::sync::atomic::Ordering::Relaxed);
+                let cur_fps = profile.fps.load(std::sync::atomic::Ordering::Relaxed).max(1) as u64;
+
+                let encoder = codec::FrameEncoder::new(cur_quality);
+
                 match capturer.capture_frame() {
                     Ok(frame) => {
+                        profile.native_w.store(frame.width, std::sync::atomic::Ordering::Relaxed);
+                        profile.native_h.store(frame.height, std::sync::atomic::Ordering::Relaxed);
+
                         if frame.is_dirty {
-                            if let Ok(jpeg) = encoder.encode(frame.width, frame.height, &frame.data) {
+                            if let Ok((jpeg, out_w, out_h)) = encoder.encode_scaled(
+                                frame.width,
+                                frame.height,
+                                &frame.data,
+                                cur_max_width,
+                            ) {
+                                profile.stream_w.store(out_w, std::sync::atomic::Ordering::Relaxed);
+                                profile.stream_h.store(out_h, std::sync::atomic::Ordering::Relaxed);
+
                                 let msg = protocol::Message::ScreenFrame {
                                     data: jpeg,
-                                    width: frame.width,
-                                    height: frame.height,
+                                    width: out_w,
+                                    height: out_h,
                                     timestamp: chrono::Utc::now().timestamp_millis(),
                                 };
                                 if let Err(e) = stream_channel.send(&msg).await {
@@ -81,7 +229,7 @@ fn spawn_screen_stream_task(
                 }
 
                 let elapsed = start.elapsed();
-                let target = std::time::Duration::from_millis(33);
+                let target = std::time::Duration::from_millis(1000 / cur_fps);
                 if elapsed < target {
                     tokio::time::sleep(target - elapsed).await;
                 }
@@ -167,7 +315,12 @@ pub fn run() {
                                 let is_sharing_stream = Arc::clone(&is_sharing);
                                 is_sharing_stream.store(true, std::sync::atomic::Ordering::SeqCst);
 
-                                let _capture_task = spawn_screen_stream_task(channel.clone(), is_sharing_stream);
+                                let profile = StreamProfile::new(false);
+                                let capture_task = spawn_screen_stream_task(
+                                    channel.clone(),
+                                    is_sharing_stream,
+                                    Arc::clone(&profile),
+                                );
 
                                 // Start clipboard sync on host for direct QUIC session
                                 let mut host_clipboard = clipboard::ClipboardMonitor::new();
@@ -188,83 +341,16 @@ pub fn run() {
                                 tokio::spawn(async move {
                                     loop {
                                         match channel_rx.recv().await {
-                                            Ok(msg) => match msg {
-                                                protocol::Message::MouseEvent {
-                                                    x,
-                                                    y,
-                                                    button,
-                                                    action,
-                                                    delta_x,
-                                                    delta_y,
-                                                } => {
-                                                    if let Some(ref sim) = input_sim_rx {
-                                                        let _ = sim.handle_mouse_event(
-                                                            &protocol::MouseEvent {
-                                                                x,
-                                                                y,
-                                                                button,
-                                                                action,
-                                                                delta_x,
-                                                                delta_y,
-                                                            },
-                                                        );
-                                                    }
-                                                }
-                                                protocol::Message::KeyEvent { key, action } => {
-                                                    if let Some(ref sim) = input_sim_rx {
-                                                        let _ = sim.handle_key_event(
-                                                            &protocol::KeyEvent { key, action },
-                                                        );
-                                                    }
-                                                }
-                                                protocol::Message::TypeText { text } => {
-                                                    if let Some(ref sim) = input_sim_rx {
-                                                        let _ = sim.type_text(&text);
-                                                    }
-                                                }
-                                                protocol::Message::ClipboardUpdate { content } => {
-                                                    let _ =
-                                                        clipboard::ClipboardMonitor::set_text_silent(
-                                                            &content,
-                                                        ).await;
-                                                }
-                                                protocol::Message::FileTransferStart {
-                                                    id,
-                                                    filename,
-                                                    total_bytes,
-                                                    file_hash,
-                                                } => {
-                                                    commands::handle_file_start(
-                                                        id,
-                                                        filename,
-                                                        total_bytes,
-                                                        file_hash,
-                                                        transfer_receivers_rx.clone(),
-                                                    )
-                                                    .await;
-                                                }
-                                                protocol::Message::FileChunk {
-                                                    id,
-                                                    offset,
-                                                    data,
-                                                    is_last,
-                                                } => {
-                                                    commands::handle_file_chunk(
-                                                        id,
-                                                        offset,
-                                                        data,
-                                                        is_last,
-                                                        transfer_receivers_rx.clone(),
-                                                    )
-                                                    .await;
-                                                }
-                                                protocol::Message::Ping { timestamp } => {
-                                                    let _ = channel_rx
-                                                        .send(&protocol::Message::Pong { timestamp })
-                                                        .await;
-                                                }
-                                                _ => {}
-                                            },
+                                            Ok(msg) => {
+                                                handle_host_incoming_message(
+                                                    msg,
+                                                    &channel_rx,
+                                                    &input_sim_rx,
+                                                    &transfer_receivers_rx,
+                                                    &profile,
+                                                )
+                                                .await;
+                                            }
                                             Err(e) => {
                                                 log::info!("Client disconnected: {}", e);
                                                 is_sharing_clone
@@ -274,6 +360,7 @@ pub fn run() {
                                         }
                                     }
                                     host_clipboard.stop_monitoring();
+                                    capture_task.abort();
                                 });
                             }
                             Err(e) => {
@@ -334,7 +421,12 @@ pub fn run() {
                             let is_sharing_stream = Arc::clone(&relay_is_sharing);
                             is_sharing_stream.store(true, std::sync::atomic::Ordering::SeqCst);
 
-                            let capture_task = spawn_screen_stream_task(channel.clone(), Arc::clone(&relay_is_sharing));
+                            let profile = StreamProfile::new(true);
+                            let capture_task = spawn_screen_stream_task(
+                                channel.clone(),
+                                Arc::clone(&relay_is_sharing),
+                                Arc::clone(&profile),
+                            );
 
                             // Start clipboard sync on host for TCP Relay session
                             let mut host_clipboard = clipboard::ClipboardMonitor::new();
@@ -354,83 +446,16 @@ pub fn run() {
 
                             loop {
                                 match channel_rx.recv().await {
-                                    Ok(msg) => match msg {
-                                        protocol::Message::MouseEvent {
-                                            x,
-                                            y,
-                                            button,
-                                            action,
-                                            delta_x,
-                                            delta_y,
-                                        } => {
-                                            if let Some(ref sim) = input_sim_rx {
-                                                let _ = sim.handle_mouse_event(
-                                                    &protocol::MouseEvent {
-                                                        x,
-                                                        y,
-                                                        button,
-                                                        action,
-                                                        delta_x,
-                                                        delta_y,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        protocol::Message::KeyEvent { key, action } => {
-                                            if let Some(ref sim) = input_sim_rx {
-                                                let _ = sim.handle_key_event(
-                                                    &protocol::KeyEvent { key, action },
-                                                );
-                                            }
-                                        }
-                                        protocol::Message::TypeText { text } => {
-                                            if let Some(ref sim) = input_sim_rx {
-                                                let _ = sim.type_text(&text);
-                                            }
-                                        }
-                                        protocol::Message::ClipboardUpdate { content } => {
-                                            let _ =
-                                                clipboard::ClipboardMonitor::set_text_silent(
-                                                    &content,
-                                                ).await;
-                                        }
-                                        protocol::Message::FileTransferStart {
-                                            id,
-                                            filename,
-                                            total_bytes,
-                                            file_hash,
-                                        } => {
-                                            commands::handle_file_start(
-                                                id,
-                                                filename,
-                                                total_bytes,
-                                                file_hash,
-                                                transfer_receivers_rx.clone(),
-                                            )
-                                            .await;
-                                        }
-                                        protocol::Message::FileChunk {
-                                            id,
-                                            offset,
-                                            data,
-                                            is_last,
-                                        } => {
-                                            commands::handle_file_chunk(
-                                                id,
-                                                offset,
-                                                data,
-                                                is_last,
-                                                transfer_receivers_rx.clone(),
-                                            )
-                                            .await;
-                                        }
-                                        protocol::Message::Ping { timestamp } => {
-                                            let _ = channel_rx
-                                                .send(&protocol::Message::Pong { timestamp })
-                                                .await;
-                                        }
-                                        _ => {}
-                                    },
+                                    Ok(msg) => {
+                                        handle_host_incoming_message(
+                                            msg,
+                                            &channel_rx,
+                                            &input_sim_rx,
+                                            &transfer_receivers_rx,
+                                            &profile,
+                                        )
+                                        .await;
+                                    }
                                     Err(e) => {
                                         log::info!("Relay peer session ended: {}", e);
                                         is_sharing_clone.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -484,6 +509,7 @@ pub fn run() {
             commands::login_account,
             commands::register_account,
             commands::logout_account,
+            commands::set_stream_quality,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
