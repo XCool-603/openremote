@@ -50,6 +50,15 @@ mod win_d3d11 {
 
     const CLASS_NAME: PCWSTR = w!("OpenRemoteD3D11Viewport");
     static REGISTER_CLASS_ONCE: Once = Once::new();
+    const WM_CHAR_MSG: u32 = 0x0102;
+    const WM_IME_CHAR_MSG: u32 = 0x0286;
+    const WM_GETDLGCODE_MSG: u32 = 0x0087;
+    const DLGC_WANTALLKEYS_FLAGS: isize = 0x0007; // DLGC_WANTARROWS | DLGC_WANTTAB | DLGC_WANTALLKEYS
+
+    #[link(name = "imm32")]
+    extern "system" {
+        fn ImmAssociateContext(hwnd: isize, himc: isize) -> isize;
+    }
 
     const VS_HLSL: &str = r#"
 cbuffer CropCB : register(b0) {
@@ -111,6 +120,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         input_locked: AtomicBool,
         is_relay: AtomicBool,
         cursor_kind: AtomicU8, // 0=arrow,1=ibeam,2=hand,3=we,4=ns,5=nesw,6=nwse,7=all,8=wait
+        modifier_mask: AtomicU8, // bitmask of held modifiers on this viewport HWND
         last_move_ms: AtomicI64,
         pending_move: AtomicU64,
         move_notify: Arc<tokio::sync::Notify>,
@@ -130,6 +140,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
                 input_locked: AtomicBool::new(true),
                 is_relay: AtomicBool::new(false),
                 cursor_kind: AtomicU8::new(0),
+                modifier_mask: AtomicU8::new(0),
                 last_move_ms: AtomicI64::new(0),
                 pending_move: AtomicU64::new(0),
                 move_notify: Arc::new(tokio::sync::Notify::new()),
@@ -203,14 +214,36 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         }
     }
 
-    fn vk_to_key_string(vk: u16, extended: bool) -> Option<String> {
+    fn modifier_bit(key: &str) -> u8 {
+        match key {
+            "ShiftLeft" | "Shift" => 1 << 0,
+            "ShiftRight" => 1 << 1,
+            "ControlLeft" | "Control" => 1 << 2,
+            "ControlRight" => 1 << 3,
+            "AltLeft" | "Alt" => 1 << 4,
+            "AltRight" => 1 << 5,
+            "MetaLeft" | "Meta" => 1 << 6,
+            "MetaRight" => 1 << 7,
+            _ => 0,
+        }
+    }
+
+    fn vk_to_key_string(vk: u16, lparam: isize) -> Option<String> {
+        let extended = (lparam & (1 << 24)) != 0;
+        let scancode = ((lparam >> 16) & 0xFF) as u16;
         let s = match vk {
             0x08 => "Backspace",
             0x09 => "Tab",
-            0x0D => "Enter",
-            0x10 | 0xA0 | 0xA1 => "Shift",
-            0x11 | 0xA2 | 0xA3 => "Control",
-            0x12 | 0xA4 | 0xA5 => "Alt",
+            0x0D => if extended { "NumpadEnter" } else { "Enter" },
+            0x10 => if scancode == 0x36 { "ShiftRight" } else { "ShiftLeft" },
+            0xA0 => "ShiftLeft",
+            0xA1 => "ShiftRight",
+            0x11 => if extended { "ControlRight" } else { "ControlLeft" },
+            0xA2 => "ControlLeft",
+            0xA3 => "ControlRight",
+            0x12 => if extended { "AltRight" } else { "AltLeft" },
+            0xA4 => "AltLeft",
+            0xA5 => "AltRight",
             0x13 => "Pause",
             0x14 => "CapsLock",
             0x1B => "Escape",
@@ -226,8 +259,14 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             0x2C => "PrintScreen",
             0x2D => "Insert",
             0x2E => "Delete",
-            0x5B | 0x5C => "Meta",
+            0x5B => "MetaLeft",
+            0x5C => "MetaRight",
             0x5D => "ContextMenu",
+            0x6A => "NumpadMultiply",
+            0x6B => "NumpadAdd",
+            0x6D => "NumpadSubtract",
+            0x6E => "NumpadDecimal",
+            0x6F => "NumpadDivide",
             0x90 => "NumLock",
             0x91 => "ScrollLock",
             0xBA => ";",
@@ -241,6 +280,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             0xDC => "\\",
             0xDD => "]",
             0xDE => "'",
+            0xE2 => "IntlBackslash",
             0x41..=0x5A => {
                 let ch = ((vk - 0x41) as u8 + b'a') as char;
                 return Some(ch.to_string());
@@ -255,10 +295,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             0x60..=0x69 => {
                 return Some(format!("Numpad{}", vk - 0x60));
             }
-            _ => {
-                let _ = extended;
-                return None;
-            }
+            _ => return None,
         };
         Some(s.to_string())
     }
@@ -380,29 +417,63 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
                 }
                 LRESULT(0)
             }
+            WM_GETDLGCODE_MSG => LRESULT(DLGC_WANTALLKEYS_FLAGS),
             WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
                 if shared.input_locked.load(Ordering::Relaxed) {
                     let vk = wparam.0 as u16;
-                    let extended = (lparam.0 & (1 << 24)) != 0;
-                    if let Some(key) = vk_to_key_string(vk, extended) {
-                        let action = if msg == WM_KEYUP || msg == WM_SYSKEYUP {
-                            KeyAction::Up
-                        } else {
-                            KeyAction::Down
-                        };
+                    if let Some(key) = vk_to_key_string(vk, lparam.0) {
+                        let is_up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+                        let bit = modifier_bit(&key);
+                        if bit != 0 {
+                            if is_up {
+                                shared.modifier_mask.fetch_and(!bit, Ordering::Relaxed);
+                            } else {
+                                shared.modifier_mask.fetch_or(bit, Ordering::Relaxed);
+                            }
+                        }
+                        let action = if is_up { KeyAction::Up } else { KeyAction::Down };
                         shared.send_input(Message::KeyEvent { key, action });
                         return LRESULT(0);
                     }
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            WM_KILLFOCUS => {
+            WM_IME_CHAR_MSG | WM_CHAR_MSG => {
                 if shared.input_locked.load(Ordering::Relaxed) {
-                    for mod_key in ["Control", "Shift", "Alt", "Meta"] {
-                        shared.send_input(Message::KeyEvent {
-                            key: mod_key.to_string(),
-                            action: KeyAction::Up,
-                        });
+                    let code = wparam.0 as u32;
+                    // ASCII printable/control keys are already sent as exact raw WM_KEYDOWN/UP;
+                    // only forward non-ASCII characters (IME/Unicode tools) via TypeText.
+                    if code >= 0x80 || (msg == WM_IME_CHAR_MSG && code >= 0x20) {
+                        if let Some(ch) = char::from_u32(code) {
+                            shared.send_input(Message::TypeText {
+                                text: ch.to_string(),
+                            });
+                            return LRESULT(0);
+                        }
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_KILLFOCUS => {
+                let mask = shared.modifier_mask.swap(0, Ordering::AcqRel);
+                if shared.input_locked.load(Ordering::Relaxed) {
+                    let mods = [
+                        (1 << 0, "ShiftLeft"),
+                        (1 << 1, "ShiftRight"),
+                        (1 << 2, "ControlLeft"),
+                        (1 << 3, "ControlRight"),
+                        (1 << 4, "AltLeft"),
+                        (1 << 5, "AltRight"),
+                        (1 << 6, "MetaLeft"),
+                        (1 << 7, "MetaRight"),
+                    ];
+                    for (bit, mod_key) in mods {
+                        if (mask & bit) != 0 {
+                            shared.send_input(Message::KeyEvent {
+                                key: mod_key.to_string(),
+                                action: KeyAction::Up,
+                            });
+                        }
                     }
                 }
                 LRESULT(0)
@@ -673,7 +744,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             }
         };
 
-        let mut decoder = match H264Decoder::new(device.clone(), mgr) {
+        let mut decoder = match H264Decoder::new(device.clone(), mgr.clone()) {
             Ok(d) => d,
             Err(e) => {
                 crate::diag_log(&format!("H264Decoder init failed: {}", e));
@@ -739,7 +810,19 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        crate::diag_log(&format!("H264 decode error (recovering next keyframe): {}", e));
+                        crate::diag_log(&format!(
+                            "H264 decode error at {}x{} (keyframe={}): {} -> recreating decoder",
+                            frame_pkt.width, frame_pkt.height, frame_pkt.is_keyframe, e
+                        ));
+                        if let Ok(fresh) = H264Decoder::new(device.clone(), mgr.clone()) {
+                            decoder = fresh;
+                            if frame_pkt.is_keyframe {
+                                if let Ok(Some(dec)) = decoder.decode(&frame_pkt.data, frame_pkt.width, frame_pkt.height) {
+                                    diag_dec_ms_sum += dec_t0.elapsed().as_secs_f64() * 1000.0;
+                                    last_decoded = Some(dec);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1022,6 +1105,9 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
                     match res {
                         Ok(child) => {
                             SetWindowLongPtrW(child, GWLP_USERDATA, shared_ptr);
+                            // Disable local IME on the remote viewport child HWND so Windows delivers
+                            // raw WM_KEYDOWN virtual keys (never VK_PROCESSKEY) and lets the remote OS IME handle text.
+                            let _ = ImmAssociateContext(child.0 as isize, 0);
                             let _ = tx.send(Ok(child.0 as isize));
                         }
                         Err(e) => {

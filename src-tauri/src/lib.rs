@@ -411,14 +411,22 @@ async fn handle_host_incoming_message(
             let chan = channel_rx.clone();
             tokio::spawn(async move {
                 if width == 0 || height == 0 {
+                    let restored = tokio::task::spawn_blocking(input::restore_display_resolution)
+                        .await
+                        .ok()
+                        .flatten();
                     prof.max_width.store(0, Ordering::Relaxed);
                     prof.quality_backoff.store(0, Ordering::Relaxed);
                     prof.need_keyframe.store(true, Ordering::Release);
+                    let notice_msg = restored
+                        .as_ref()
+                        .map(|r| r.message.clone())
+                        .unwrap_or_else(|| "已切换为远程原生分辨率输出".to_string());
                     if prof.supports_notice.load(Ordering::Acquire) {
                         let _ = chan
                             .send(&protocol::Message::HostNotice {
                                 level: "info".to_string(),
-                                message: "已切换为远程原生分辨率输出".to_string(),
+                                message: notice_msg,
                             })
                             .await;
                     }
@@ -443,6 +451,10 @@ async fn handle_host_incoming_message(
                             // Stream the newly applied OS resolution 1:1 natively
                             prof.max_width.store(0, Ordering::Relaxed);
                         } else {
+                            // If a larger preset wasn't natively listed while OS was previously downshifted, restore native OS mode first
+                            if width > prof.native_w.load(Ordering::Relaxed) {
+                                let _ = tokio::task::spawn_blocking(input::restore_display_resolution).await;
+                            }
                             // Fallback cleanly to adjusting streaming resolution width
                             prof.max_width.store(width, Ordering::Relaxed);
                         }
@@ -1129,6 +1141,7 @@ fn spawn_quic_accept_loop(
                                     handle.sender_task.abort();
                                 }
                                 clear_host_control_status();
+                                let _ = tokio::task::spawn_blocking(input::restore_display_resolution).await;
                             }
                         }
                     });
@@ -1403,7 +1416,7 @@ pub fn spawn_host_daemon(
             let punch_task = tokio::spawn(async move {
                 let mut tick = 0u32;
                 while !stop_punch.load(Ordering::Acquire) {
-                    if tick % 40 == 0 {
+                    if tick % 32 == 0 {
                         if let Some(stun_addr) = stun_addr_opt {
                             let _ = punch_sock.send_to(b"KEEPALIVE", stun_addr);
                         }
@@ -1411,18 +1424,18 @@ pub fn spawn_host_daemon(
                     let targets = crate::signaling::poll_udp_punches(&signal_url_punch, &d_code_punch).await;
                     for ctrl_addr in targets {
                         diag_log(&format!(
-                            "[HostPunch] received punch request -> sustained 22x100ms UDP burst + symmetric fan [-28..+16] to {}",
+                            "[HostPunch] received punch request -> sustained 24x90ms UDP burst + symmetric fan [-32..+48] to {}",
                             ctrl_addr
                         ));
                         if let Ok(sock) = punch_sock.try_clone() {
                             tokio::spawn(async move {
-                                for round in 0..22 {
+                                for round in 0..24 {
                                     let _ = sock.send_to(b"OPRM_PUNCH", ctrl_addr);
-                                    // Fan out across [-28..+16] around reported NAT port on the first 8 rounds
-                                    // so pooled Symmetric NAT blocks (e.g. 2048..2080) open before QUIC arrives
-                                    if round < 8 {
+                                    // Fan out asymmetrically [-32..+48] around reported NAT port on the first 12 rounds
+                                    // because pooled Symmetric NATs allocate consecutive ports upward across peers.
+                                    if round < 12 {
                                         let base_port = ctrl_addr.port();
-                                        for delta in -28i32..=16i32 {
+                                        for delta in -32i32..=48i32 {
                                             if delta == 0 {
                                                 continue;
                                             }
@@ -1433,13 +1446,13 @@ pub fn spawn_host_daemon(
                                             }
                                         }
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(90)).await;
                                 }
                             });
                         }
                     }
                     tick = tick.wrapping_add(1);
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             });
             tasks_main.lock().await.push(punch_task);

@@ -128,7 +128,14 @@ fn probe_rfc5389_stun_addr(socket: &UdpSocket, addr: SocketAddr) -> Option<(Stri
 
     socket.send_to(&req, addr).ok()?;
     let mut buf = [0u8; 512];
-    let (n, _) = socket.recv_from(&mut buf).ok()?;
+    let (n, _) = match socket.recv_from(&mut buf) {
+        Ok(res) => res,
+        Err(_) => {
+            // Fast 1x retry in case initial UDP packet dropped on busy Wi-Fi / NAT
+            socket.send_to(&req, addr).ok()?;
+            socket.recv_from(&mut buf).ok()?
+        }
+    };
     if n < 20 || buf[0] != 0x01 || buf[1] != 0x01 || &buf[8..20] != &tx_id {
         return None;
     }
@@ -225,7 +232,7 @@ pub async fn probe_stun_detailed_direct(socket: &UdpSocket, signal_url: &str) ->
 
     tokio::task::spawn_blocking(move || {
         let orig_timeout = sock_clone.read_timeout().ok().flatten();
-        let _ = sock_clone.set_read_timeout(Some(Duration::from_millis(550)));
+        let _ = sock_clone.set_read_timeout(Some(Duration::from_millis(700)));
         let mut rfc_mapped = None;
         let mut custom_mapped = None;
 

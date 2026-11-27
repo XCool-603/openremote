@@ -29,18 +29,19 @@ function normalizeKeyboardKey(e: KeyboardEvent): string | null {
     switch (code) {
       case 'ShiftLeft':
       case 'ShiftRight':
-        return 'Shift';
       case 'ControlLeft':
       case 'ControlRight':
-        return 'Control';
       case 'AltLeft':
       case 'AltRight':
-        return 'Alt';
       case 'MetaLeft':
       case 'MetaRight':
+      case 'NumpadEnter':
+      case 'IntlBackslash':
+        return code;
       case 'OSLeft':
+        return 'MetaLeft';
       case 'OSRight':
-        return 'Meta';
+        return 'MetaRight';
       case 'Space':
         return ' ';
       case 'Minus':
@@ -66,7 +67,6 @@ function normalizeKeyboardKey(e: KeyboardEvent): string | null {
       case 'Slash':
         return '/';
       case 'Enter':
-      case 'NumpadEnter':
         return 'Enter';
       case 'Backspace':
       case 'Tab':
@@ -619,19 +619,30 @@ export const RemoteView: React.FC = () => {
       safeInvoke('send_key_event', { key, action: 'Up' }).catch(reportInputError);
     };
 
+    const onCompositionEnd = (e: CompositionEvent) => {
+      if (isEditableTarget(e.target) || !e.data) return;
+      for (const ch of e.data) {
+        if (ch.charCodeAt(0) >= 0x80) {
+          safeInvoke('send_key_event', { key: ch, action: 'Click' }).catch(reportInputError);
+        }
+      }
+    };
+
     // Release modifier keys if controller window loses focus so remote modifiers never stick
     const onBlur = () => {
-      for (const mod of ['Control', 'Shift', 'Alt', 'Meta']) {
+      for (const mod of ['ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight', 'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight']) {
         safeInvoke('send_key_event', { key: mod, action: 'Up' }).catch(() => {});
       }
     };
 
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
+    window.addEventListener('compositionend', onCompositionEnd, true);
     window.addEventListener('blur', onBlur);
     return () => {
       window.removeEventListener('keydown', onKeyDown, true);
       window.removeEventListener('keyup', onKeyUp, true);
+      window.removeEventListener('compositionend', onCompositionEnd, true);
       window.removeEventListener('blur', onBlur);
     };
   }, [isConnected, inputLocked, reportInputError]);
@@ -858,8 +869,8 @@ export const RemoteView: React.FC = () => {
     disconnect();
   };
 
-  const localScreenW = Math.round((window.screen?.width || 1920) * (window.devicePixelRatio || 1));
-  const localScreenH = Math.round((window.screen?.height || 1080) * (window.devicePixelRatio || 1));
+  const localScreenW = (Math.round((window.screen?.width || 1920) * (window.devicePixelRatio || 1)) + 1) & ~1;
+  const localScreenH = (Math.round((window.screen?.height || 1080) * (window.devicePixelRatio || 1)) + 1) & ~1;
 
   return (
     <div
@@ -1098,8 +1109,12 @@ export const RemoteView: React.FC = () => {
           {[
             { w: 3840, h: 2160 },
             { w: 2560, h: 1440 },
+            { w: 1920, h: 1200 },
             { w: 1920, h: 1080 },
+            { w: 1680, h: 1050 },
             { w: 1600, h: 900 },
+            { w: 1440, h: 900 },
+            { w: 1280, h: 800 },
             { w: 1280, h: 720 },
           ].map((preset) => {
             const active = remoteRes.w === preset.w && remoteRes.h === preset.h;

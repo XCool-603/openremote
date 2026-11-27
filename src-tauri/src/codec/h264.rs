@@ -765,9 +765,46 @@ mod win_h264 {
                 sample.SetSampleTime(pts)?;
                 sample.SetSampleDuration(166_667)?;
 
-                self.mft.ProcessInput(0, &sample, 0)?;
-
+                const MF_E_NOTACCEPTING: HRESULT = HRESULT(0xC00D36B5u32 as i32);
                 let mut latest: Option<DecodedNv12Frame> = None;
+
+                if let Err(err) = self.mft.ProcessInput(0, &sample, 0) {
+                    if err.code() == MF_E_NOTACCEPTING {
+                        // Drain queued output frames first so MFT accepts input again (e.g. during resolution switch)
+                        for _ in 0..8 {
+                            let alloc_sample: Option<IMFSample> = if self.mft_provides_samples {
+                                None
+                            } else {
+                                let s = MFCreateSample()?;
+                                let b = MFCreateMemoryBuffer(self.output_buf_min_size)?;
+                                s.AddBuffer(&b)?;
+                                Some(s)
+                            };
+                            let mut out_buf = MFT_OUTPUT_DATA_BUFFER {
+                                dwStreamID: 0,
+                                pSample: ManuallyDrop::new(alloc_sample),
+                                dwStatus: 0,
+                                pEvents: ManuallyDrop::new(None),
+                            };
+                            let mut status = 0u32;
+                            let res = self.mft.ProcessOutput(0, std::slice::from_mut(&mut out_buf), &mut status);
+                            let _ = ManuallyDrop::take(&mut out_buf.pSample);
+                            let _ = ManuallyDrop::take(&mut out_buf.pEvents);
+                            match res {
+                                Ok(()) => {}
+                                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                                    self.negotiate_output_type()?;
+                                }
+                                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
+                                Err(_) => break,
+                            }
+                        }
+                        self.mft.ProcessInput(0, &sample, 0)?;
+                    } else {
+                        return Err(err.into());
+                    }
+                }
+
                 for _ in 0..8 {
                     let alloc_sample: Option<IMFSample> = if self.mft_provides_samples {
                         None

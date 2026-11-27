@@ -1056,6 +1056,10 @@ pub async fn connect_to_device(
                 // Detailed STUN probe (RFC 5389 + custom STUN) bypassing Clash Fake-IP / TUN
                 let stun_diag = crate::nat::probe_stun_detailed_direct(&ctrl_udp, &sig_url).await;
                 let stun_res = stun_diag.best_addr();
+                let is_symmetric = matches!(
+                    (&stun_diag.rfc_mapped, &stun_diag.custom_mapped),
+                    (Some((_, p1)), Some((_, p2))) if p1 != p2
+                );
 
                 if let Some((ctrl_ip, ctrl_port)) = stun_res {
                     crate::diag_log(&format!(
@@ -1103,8 +1107,8 @@ pub async fn connect_to_device(
                         req_t0.elapsed().as_millis(),
                         punch_status
                     ));
-                    // Wait 260ms so Host's 250ms punch poll picks up our punch request & opens Host's NAT!
-                    tokio::time::sleep(Duration::from_millis(260)).await;
+                    // Wait 280ms so Host's 200ms punch poll picks up our punch request & starts spraying [-32..+48]
+                    tokio::time::sleep(Duration::from_millis(280)).await;
                 } else {
                     crate::diag_log(&format!(
                         "[CtrlPunch] STUN failed ({}), unilateral punch to {}",
@@ -1115,32 +1119,65 @@ pub async fn connect_to_device(
                     }
                 }
 
-                let punch_clone = ctrl_udp.try_clone().ok();
-                let punch_bg = punch_clone.map(|sock| {
-                    tokio::spawn(async move {
-                        for _ in 0..22 {
+                // Helper that sends punch packets continuously from a socket while racing QUIC handshake
+                let race_socket = |sock: std::net::UdpSocket, extra_delay_ms: u64| async move {
+                    if extra_delay_ms > 0 {
+                        for _ in 0..3 {
                             let _ = sock.send_to(b"OPRM_PUNCH", target_addr);
-                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
-                    })
-                });
-
-                let quic_t0 = Instant::now();
-                let res = match QuicClient::new_with_socket(ctrl_udp) {
-                    Ok(client) => {
-                        match tokio::time::timeout(Duration::from_millis(2400), client.connect(target_addr)).await {
-                            Ok(Ok(chan)) => Ok(("P2P".to_string(), target_addr, chan)),
-                            Ok(Err(e)) => Err(format!("P2P {} err ({}ms): {}", target_addr, quic_t0.elapsed().as_millis(), e)),
-                            Err(_) => Err(format!("P2P {} timeout ({}ms)", target_addr, quic_t0.elapsed().as_millis())),
-                        }
+                        tokio::time::sleep(Duration::from_millis(extra_delay_ms)).await;
                     }
-                    Err(e) => Err(format!("P2P client err: {}", e)),
+                    let punch_clone = sock.try_clone().ok();
+                    let punch_bg = punch_clone.map(|ps| {
+                        tokio::spawn(async move {
+                            for _ in 0..22 {
+                                let _ = ps.send_to(b"OPRM_PUNCH", target_addr);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        })
+                    });
+
+                    let quic_t0 = Instant::now();
+                    let res = match QuicClient::new_with_socket(sock) {
+                        Ok(client) => {
+                            match tokio::time::timeout(Duration::from_millis(2400), client.connect(target_addr)).await {
+                                Ok(Ok(chan)) => Ok(("P2P".to_string(), target_addr, chan)),
+                                Ok(Err(e)) => Err(format!("P2P {} err ({}ms): {}", target_addr, quic_t0.elapsed().as_millis(), e)),
+                                Err(_) => Err(format!("P2P {} timeout ({}ms)", target_addr, quic_t0.elapsed().as_millis())),
+                            }
+                        }
+                        Err(e) => Err(format!("P2P client err: {}", e)),
+                    };
+                    if let Some(bg) = punch_bg {
+                        bg.abort();
+                    }
+                    res
                 };
 
-                if let Some(bg) = punch_bg {
-                    bg.abort();
+                // Under Symmetric NAT, race up to 4 staggered sockets (Birthday-Paradox NAT port sampling)
+                // so at least one allocated external port hits Host's [-32..+48] spray range.
+                let mut p2p_race = tokio::task::JoinSet::new();
+                p2p_race.spawn(race_socket(ctrl_udp, 0));
+                if is_symmetric {
+                    for racer_idx in 1u64..=3 {
+                        if let Ok(extra_udp) = crate::nat::bind_udp_direct(0) {
+                            p2p_race.spawn(race_socket(extra_udp, racer_idx * 90));
+                        }
+                    }
                 }
-                res
+
+                let mut last_err = format!("P2P {} failed", target_addr);
+                while let Some(joined) = p2p_race.join_next().await {
+                    match joined {
+                        Ok(Ok(ok)) => {
+                            p2p_race.abort_all();
+                            return Ok(ok);
+                        }
+                        Ok(Err(e)) => last_err = e,
+                        Err(e) => last_err = format!("P2P join err: {}", e),
+                    }
+                }
+                Err(last_err)
             });
         }
 

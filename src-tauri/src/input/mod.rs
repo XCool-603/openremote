@@ -57,7 +57,10 @@ mod win_input {
     const DM_PELSHEIGHT: u32 = 0x0010_0000;
     const DM_DISPLAYFREQUENCY: u32 = 0x0040_0000;
     const CDS_TEST: u32 = 0x0000_0002;
+    const ENUM_CURRENT_SETTINGS: u32 = u32::MAX;
     const DISP_CHANGE_SUCCESSFUL: i32 = 0;
+
+    static INITIAL_DISPLAY_MODE: std::sync::Mutex<Option<DevModeW>> = std::sync::Mutex::new(None);
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -442,6 +445,7 @@ mod win_input {
             "Comma" => return ParsedKey::Vk(0xBC, false),
             "Period" => return ParsedKey::Vk(0xBE, false),
             "Slash" => return ParsedKey::Vk(0xBF, false),
+            "IntlBackslash" => return ParsedKey::Vk(0xE2, false),
             "NumpadEnter" => return ParsedKey::Vk(0x0D, true),
             "NumpadAdd" => return ParsedKey::Vk(0x6B, false),
             "NumpadSubtract" => return ParsedKey::Vk(0x6D, false),
@@ -719,8 +723,21 @@ mod win_input {
         }
     }
 
+    fn run_on_input_desktop<T: Send + 'static, F: FnOnce() -> T + Send + 'static>(f: F) -> Result<T> {
+        thread::Builder::new()
+            .name("openremote-display".to_string())
+            .spawn(move || {
+                reattach_input_desktop();
+                f()
+            })
+            .map_err(|e| anyhow!("Failed to spawn display thread: {}", e))?
+            .join()
+            .map_err(|_| anyhow!("Display thread panicked"))
+    }
+
     /// Attempt to change the Windows primary monitor's physical resolution dynamically.
-    /// Searches supported modes via EnumDisplaySettingsW, validates with CDS_TEST, and applies via ChangeDisplaySettingsW.
+    /// Executes on the active console input desktop (works under Session 0 LocalSystem service),
+    /// remembers the initial native display mode for restoration, validates with CDS_TEST, and applies via ChangeDisplaySettingsW.
     pub fn change_display_resolution(target_w: u32, target_h: u32) -> DisplayChangeResult {
         if target_w < 640 || target_h < 480 {
             return DisplayChangeResult {
@@ -732,9 +749,26 @@ mod win_input {
             };
         }
 
-        unsafe {
-            let mut best: Option<DevModeW> = None;
+        match run_on_input_desktop(move || unsafe {
+            let mut cur_dm: DevModeW = zeroed();
+            cur_dm.dm_size = size_of::<DevModeW>() as u16;
+            if EnumDisplaySettingsW(ptr::null(), ENUM_CURRENT_SETTINGS, &mut cur_dm) != 0 {
+                if let Ok(mut guard) = INITIAL_DISPLAY_MODE.lock() {
+                    if guard.is_none() {
+                        *guard = Some(cur_dm);
+                    }
+                }
+            }
+
+            let mut exact_best: Option<DevModeW> = None;
+            let mut near_best: Option<(u32, DevModeW)> = None;
             let mut mode_idx: u32 = 0;
+
+            let pick_better = |cur: DevModeW, cand: DevModeW| -> bool {
+                (cand.dm_bits_per_pel > cur.dm_bits_per_pel)
+                    || (cand.dm_bits_per_pel == cur.dm_bits_per_pel
+                        && cand.dm_display_frequency > cur.dm_display_frequency)
+            };
 
             loop {
                 let mut dm: DevModeW = zeroed();
@@ -745,21 +779,28 @@ mod win_input {
                 mode_idx += 1;
 
                 if dm.dm_pels_width == target_w && dm.dm_pels_height == target_h {
-                    let is_better = match best {
-                        None => true,
-                        Some(cur) => {
-                            (dm.dm_bits_per_pel > cur.dm_bits_per_pel)
-                                || (dm.dm_bits_per_pel == cur.dm_bits_per_pel
-                                    && dm.dm_display_frequency > cur.dm_display_frequency)
+                    if exact_best.map_or(true, |cur| pick_better(cur, dm)) {
+                        exact_best = Some(dm);
+                    }
+                } else {
+                    let dw = dm.dm_pels_width.abs_diff(target_w);
+                    let dh = dm.dm_pels_height.abs_diff(target_h);
+                    if dw <= 12 && dh <= 12 {
+                        let dist = dw + dh;
+                        let better = match near_best {
+                            None => true,
+                            Some((cur_dist, cur_dm)) => {
+                                dist < cur_dist || (dist == cur_dist && pick_better(cur_dm, dm))
+                            }
+                        };
+                        if better {
+                            near_best = Some((dist, dm));
                         }
-                    };
-                    if is_better {
-                        best = Some(dm);
                     }
                 }
             }
 
-            let mut mode = match best {
+            let mut mode = match exact_best.or_else(|| near_best.map(|(_, m)| m)) {
                 Some(m) => m,
                 None => {
                     return DisplayChangeResult {
@@ -774,6 +815,21 @@ mod win_input {
                     };
                 }
             };
+
+            if cur_dm.dm_pels_width == mode.dm_pels_width
+                && cur_dm.dm_pels_height == mode.dm_pels_height
+            {
+                return DisplayChangeResult {
+                    applied_os: true,
+                    width: mode.dm_pels_width,
+                    height: mode.dm_pels_height,
+                    refresh_hz: mode.dm_display_frequency,
+                    message: format!(
+                        "远程桌面当前已处于 {}x{} ({}Hz)",
+                        mode.dm_pels_width, mode.dm_pels_height, mode.dm_display_frequency
+                    ),
+                };
+            }
 
             mode.dm_fields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
             let test_rc = ChangeDisplaySettingsW(&mut mode, CDS_TEST);
@@ -814,7 +870,67 @@ mod win_input {
                     ),
                 }
             }
+        }) {
+            Ok(res) => res,
+            Err(e) => DisplayChangeResult {
+                applied_os: false,
+                width: target_w,
+                height: target_h,
+                refresh_hz: 0,
+                message: format!("切换分辨率桌面上下文失败 ({})，已改为推流分辨率缩放", e),
+            },
         }
+    }
+
+    /// Restore the Windows primary monitor's original resolution if changed earlier in this session.
+    pub fn restore_display_resolution() -> Option<DisplayChangeResult> {
+        let mut orig = INITIAL_DISPLAY_MODE.lock().ok().and_then(|mut g| g.take())?;
+        let res = run_on_input_desktop(move || unsafe {
+            let mut cur_dm: DevModeW = zeroed();
+            cur_dm.dm_size = size_of::<DevModeW>() as u16;
+            if EnumDisplaySettingsW(ptr::null(), ENUM_CURRENT_SETTINGS, &mut cur_dm) != 0
+                && cur_dm.dm_pels_width == orig.dm_pels_width
+                && cur_dm.dm_pels_height == orig.dm_pels_height
+            {
+                return DisplayChangeResult {
+                    applied_os: true,
+                    width: orig.dm_pels_width,
+                    height: orig.dm_pels_height,
+                    refresh_hz: orig.dm_display_frequency,
+                    message: format!(
+                        "已恢复远程原生分辨率 {}x{} ({}Hz)",
+                        orig.dm_pels_width, orig.dm_pels_height, orig.dm_display_frequency
+                    ),
+                };
+            }
+
+            orig.dm_fields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+            let rc = ChangeDisplaySettingsW(&mut orig, 0);
+            if rc == DISP_CHANGE_SUCCESSFUL {
+                DisplayChangeResult {
+                    applied_os: true,
+                    width: orig.dm_pels_width,
+                    height: orig.dm_pels_height,
+                    refresh_hz: orig.dm_display_frequency,
+                    message: format!(
+                        "已恢复远程原生分辨率 {}x{} ({}Hz)",
+                        orig.dm_pels_width, orig.dm_pels_height, orig.dm_display_frequency
+                    ),
+                }
+            } else {
+                DisplayChangeResult {
+                    applied_os: false,
+                    width: orig.dm_pels_width,
+                    height: orig.dm_pels_height,
+                    refresh_hz: orig.dm_display_frequency,
+                    message: format!(
+                        "恢复原生分辨率失败（错误码 {}），已取消推流缩放限制",
+                        rc
+                    ),
+                }
+            }
+        });
+        res.ok()
     }
 
     #[link(name = "kernel32")]
@@ -1077,6 +1193,10 @@ mod fallback_input {
         }
     }
 
+    pub fn restore_display_resolution() -> Option<DisplayChangeResult> {
+        None
+    }
+
     pub fn rdp_session_status() -> super::RdpSessionStatus {
         super::RdpSessionStatus {
             session_id: 0,
@@ -1144,14 +1264,14 @@ mod fallback_input {
 
 #[cfg(target_os = "windows")]
 pub use win_input::{
-    change_display_resolution, detach_rdp_to_console, rdp_session_status, send_sas_ctrl_alt_del,
-    InputSimulator,
+    change_display_resolution, detach_rdp_to_console, rdp_session_status,
+    restore_display_resolution, send_sas_ctrl_alt_del, InputSimulator,
 };
 
 #[cfg(not(target_os = "windows"))]
 pub use fallback_input::{
-    change_display_resolution, detach_rdp_to_console, rdp_session_status, send_sas_ctrl_alt_del,
-    InputSimulator,
+    change_display_resolution, detach_rdp_to_console, rdp_session_status,
+    restore_display_resolution, send_sas_ctrl_alt_del, InputSimulator,
 };
 
 /// Detect the current remote host OS cursor shape and map it to a standard CSS cursor keyword.
