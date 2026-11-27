@@ -7,6 +7,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 pub mod quic;
+pub mod quic_relay;
 
 pub use quic::{QuicClient, QuicServer};
 

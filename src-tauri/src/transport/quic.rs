@@ -75,6 +75,40 @@ impl QuicServer {
         })
     }
 
+    /// Bind QUIC server using a custom `AsyncUdpSocket` (e.g. UDP-QUIC Relay bridge)
+    pub fn bind_with_abstract_socket(
+        socket: Arc<dyn quinn::AsyncUdpSocket>,
+        transport_config: Arc<quinn::TransportConfig>,
+    ) -> Result<Self> {
+        let (cert, key) = generate_self_signed_cert()?;
+        let server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .context("Failed to configure rustls ServerConfig")?;
+
+        let mut server_config = ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+                .map_err(|e| anyhow!("Failed to create QuicServerConfig: {}", e))?,
+        ));
+        server_config.transport_config(transport_config);
+
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow!("No tokio runtime found for QUIC server"))?;
+        let endpoint = Endpoint::new_with_abstract_socket(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
+        .context("Failed to create QUIC server endpoint from abstract socket")?;
+
+        let listen_addr = endpoint.local_addr()?;
+        Ok(Self {
+            endpoint,
+            listen_addr,
+        })
+    }
+
     /// Accept the next raw incoming QUIC connection without blocking on its handshake
     pub async fn accept_incoming(&self) -> Result<quinn::Incoming> {
         self.endpoint
@@ -217,7 +251,21 @@ impl QuicClient {
         Ok(Self { endpoint })
     }
 
-    fn apply_client_config(endpoint: &mut Endpoint) -> Result<()> {
+    pub fn apply_client_config(endpoint: &mut Endpoint) -> Result<()> {
+        let mut transport_config = quinn::TransportConfig::default();
+        transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(15).try_into().unwrap()));
+        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
+        transport_config.initial_rtt(std::time::Duration::from_millis(15));
+        transport_config.stream_receive_window((8 * 1024 * 1024u32).into());
+        transport_config.receive_window((16 * 1024 * 1024u32).into());
+        transport_config.send_window(8 * 1024 * 1024);
+        Self::apply_client_config_with_transport(endpoint, Arc::new(transport_config))
+    }
+
+    pub fn apply_client_config_with_transport(
+        endpoint: &mut Endpoint,
+        transport_config: Arc<quinn::TransportConfig>,
+    ) -> Result<()> {
         let client_crypto = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(SkipServerVerification::new())
@@ -227,15 +275,7 @@ impl QuicClient {
             quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
                 .map_err(|e| anyhow!("Failed to create QuicClientConfig: {}", e))?,
         ));
-
-        let mut transport_config = quinn::TransportConfig::default();
-        transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(15).try_into().unwrap()));
-        transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
-        transport_config.initial_rtt(std::time::Duration::from_millis(15));
-        transport_config.stream_receive_window((8 * 1024 * 1024u32).into());
-        transport_config.receive_window((16 * 1024 * 1024u32).into());
-        transport_config.send_window(8 * 1024 * 1024);
-        client_config.transport_config(Arc::new(transport_config));
+        client_config.transport_config(transport_config);
         endpoint.set_default_client_config(client_config);
         Ok(())
     }

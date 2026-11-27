@@ -16,11 +16,12 @@ mod win_h264 {
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_NV12;
     use windows::Win32::Media::MediaFoundation::{
-        eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Main,
+        eAVEncCommonRateControlMode_PeakConstrainedVBR, eAVEncH264VProfile_Main,
         CODECAPI_AVEncCommonMaxBitRate, CODECAPI_AVEncCommonMeanBitRate,
-        CODECAPI_AVEncCommonQualityVsSpeed, CODECAPI_AVEncCommonRateControlMode,
-        CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
-        CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
+        CODECAPI_AVEncCommonQuality, CODECAPI_AVEncCommonQualityVsSpeed,
+        CODECAPI_AVEncCommonRateControlMode, CODECAPI_AVEncMPVDefaultBPictureCount,
+        CODECAPI_AVEncMPVGOPSize, CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode,
+        ICodecAPI, IMFActivate,
         IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaBuffer, IMFMediaEventGenerator,
         IMFMediaType, IMFSample, IMFTransform, METransformHaveOutput, METransformNeedInput,
         MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
@@ -252,8 +253,9 @@ mod win_h264 {
                 set_codec_u32(
                     &mft,
                     &CODECAPI_AVEncCommonRateControlMode,
-                    eAVEncCommonRateControlMode_CBR.0 as u32,
+                    eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32,
                 );
+                set_codec_u32(&mft, &CODECAPI_AVEncCommonQuality, 72);
                 set_codec_u32(&mft, &CODECAPI_AVEncCommonMeanBitRate, bitrate_bps);
                 set_codec_u32(
                     &mft,

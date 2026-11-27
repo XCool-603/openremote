@@ -988,6 +988,17 @@ pub async fn connect_to_device(
         }
     }
 
+    // If Host's STUN public port differs from its bound LAN port (e.g. router conntrack bump 28843 -> 51413),
+    // also probe public_ip:lan_port in parallel so static port-forward rules connect reliably!
+    if is_code_query && !public_v4_candidates.is_empty() && !lan_v4_candidates.is_empty() {
+        let lan_port = lan_v4_candidates[0].port();
+        let pub_ip = public_v4_candidates[0].ip();
+        let alt = SocketAddr::new(pub_ip, lan_port);
+        if !public_v4_candidates.contains(&alt) {
+            public_v4_candidates.push(alt);
+        }
+    }
+
     if is_code_query && connected_channel.is_none() {
         crate::diag_log(&format!(
             "[CtrlConnect] peer={} | LAN={:?} | WAN_V4={:?} | V6={:?}",
@@ -1189,33 +1200,55 @@ pub async fn connect_to_device(
         Some(c) => c,
         None => {
             // Direct QUIC connection to all candidates failed.
-            // Automatic fallback to TCP Relay Tunnel via dxcool.cn:28845!
+            // Prefer UDP-QUIC Relay via dxcool.cn:28844/udp (zero TCP head-of-line blocking!),
+            // with seamless fallback to legacy TCP Relay 28845 if UDP 28844 is blocked.
             if crate::signaling::is_device_code(&address) {
                 let (signal_url, auth_token) = {
                     let config = state.config.lock().await;
                     (config.signal_server_url.clone(), config.auth_token.clone())
                 };
                 let relay_addr = crate::signaling::parse_relay_address(&signal_url);
-                log::info!(
-                    "Direct connection failed. Falling back to TCP Relay tunnel at {} for device {}",
-                    relay_addr,
-                    address
-                );
-                match crate::signaling::join_relay_tunnel_with_token(
-                    &relay_addr,
+                let udp_t0 = Instant::now();
+                match crate::transport::quic_relay::connect_quic_via_udp_relay(
+                    &signal_url,
                     &address,
                     auth_token.as_deref(),
                 )
                 .await
                 {
-                    Ok(tcp_stream) => {
-                        log::info!("Successfully established TCP Relay tunnel to {}", address);
+                    Ok(udp_quic_chan) => {
+                        crate::diag_log(&format!(
+                            "[CtrlConnect] WINNER mode=Relay-UDP-QUIC target={} in {}ms",
+                            udp_quic_chan.peer_addr_label(),
+                            udp_t0.elapsed().as_millis()
+                        ));
                         connected_mode = "Relay".to_string();
-                        connected_target = relay_addr;
-                        ConnectionChannel::new_tcp(tcp_stream)
+                        connected_target = format!("UDP-QUIC({})", relay_addr);
+                        udp_quic_chan
                     }
-                    Err(e) => {
-                        return Err(format!("{}", e));
+                    Err(udp_err) => {
+                        crate::diag_log(&format!(
+                            "[CtrlConnect] UDP-QUIC Relay unavailable in {}ms ({}) -> fallback TCP Relay",
+                            udp_t0.elapsed().as_millis(),
+                            udp_err
+                        ));
+                        match crate::signaling::join_relay_tunnel_with_token(
+                            &relay_addr,
+                            &address,
+                            auth_token.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(tcp_stream) => {
+                                log::info!("Successfully established TCP Relay tunnel to {}", address);
+                                connected_mode = "Relay".to_string();
+                                connected_target = relay_addr;
+                                ConnectionChannel::new_tcp(tcp_stream)
+                            }
+                            Err(e) => {
+                                return Err(format!("{}", e));
+                            }
+                        }
                     }
                 }
             } else {

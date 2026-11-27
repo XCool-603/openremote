@@ -710,7 +710,7 @@ fn spawn_screen_stream_task(
 
                                 if !nv12.nv12.is_empty() {
                                     let bitrate_bps = if capture_profile.is_relay {
-                                        (cur_quality as u32) * 26_000
+                                        (cur_quality as u32) * 18_000
                                     } else {
                                         (cur_quality as u32) * 120_000
                                     };
@@ -1000,6 +1000,7 @@ fn spawn_disconnect_watcher(
 
 fn spawn_quic_accept_loop(
     server_arc: Arc<QuicServer>,
+    is_relay_endpoint: bool,
     state_channel: Arc<tokio::sync::Mutex<Option<transport::ConnectionChannel>>>,
     active_host_session: Arc<tokio::sync::Mutex<Option<HostSessionHandle>>>,
     input_sim: Arc<tokio::sync::Mutex<Option<Arc<input::InputSimulator>>>>,
@@ -1024,7 +1025,11 @@ fn spawn_quic_accept_loop(
                             }
                         };
 
-                        diag_log(&format!("Host accepted QUIC session from {}", channel.peer_addr_label()));
+                        diag_log(&format!(
+                            "Host accepted {} session from {}",
+                            if is_relay_endpoint { "UDP-QUIC Relay" } else { "QUIC" },
+                            channel.peer_addr_label()
+                        ));
                         let _ = &state_channel; // Keep AppState::active_channel strictly owned by outgoing controller sessions
 
                         // Immediately stop & close any previous host session so DXGI & channels release in <5ms
@@ -1035,8 +1040,10 @@ fn spawn_quic_accept_loop(
                         }
 
                         let session_active = Arc::new(AtomicBool::new(true));
-                        let profile = StreamProfile::new(false);
-                        let transport_mode = if channel.peer_addr_label().starts_with('[') {
+                        let profile = StreamProfile::new(is_relay_endpoint);
+                        let transport_mode = if is_relay_endpoint {
+                            "UDP-QUIC 中继"
+                        } else if channel.peer_addr_label().starts_with('[') {
                             "IPv6 直连"
                         } else {
                             "P2P 打洞直连"
@@ -1296,6 +1303,7 @@ pub fn spawn_host_daemon(
             *bg_quic_server.lock().await = Some(Arc::clone(&srv4_arc));
             let h = spawn_quic_accept_loop(
                 srv4_arc,
+                false,
                 bg_state_channel.clone(),
                 Arc::clone(&active_session_main),
                 bg_input_sim.clone(),
@@ -1312,12 +1320,39 @@ pub fn spawn_host_daemon(
             }
             let h = spawn_quic_accept_loop(
                 srv6_arc,
+                false,
                 bg_state_channel.clone(),
                 Arc::clone(&active_session_main),
                 bg_input_sim.clone(),
                 bg_transfer_receivers.clone(),
             );
             tasks_main.lock().await.push(h);
+        }
+
+        // Start persistent UDP-QUIC Relay server + datagram bridge (zero TCP HOL blocking across WAN!)
+        let relay_addr_quic = crate::signaling::parse_relay_address(&signal_url);
+        match transport::quic_relay::create_host_quic_relay_server(
+            relay_addr_quic.clone(),
+            d_code.clone(),
+            Arc::clone(&stop_main),
+        ) {
+            Ok((srv_relay, bridge_task)) => {
+                endpoints_main.lock().await.push(Arc::clone(&srv_relay));
+                let accept_h = spawn_quic_accept_loop(
+                    srv_relay,
+                    true,
+                    bg_state_channel.clone(),
+                    Arc::clone(&active_session_main),
+                    bg_input_sim.clone(),
+                    bg_transfer_receivers.clone(),
+                );
+                let mut tm = tasks_main.lock().await;
+                tm.push(bridge_task);
+                tm.push(accept_h);
+            }
+            Err(e) => {
+                diag_log(&format!("Host UDP-QUIC Relay server init failed: {}", e));
+            }
         }
 
         // Auto UPnP router port mapping
@@ -1376,24 +1411,26 @@ pub fn spawn_host_daemon(
                     let targets = crate::signaling::poll_udp_punches(&signal_url_punch, &d_code_punch).await;
                     for ctrl_addr in targets {
                         diag_log(&format!(
-                            "[HostPunch] received punch request -> sustained 22x100ms UDP burst + symmetric fan [-4..+12] to {}",
+                            "[HostPunch] received punch request -> sustained 22x100ms UDP burst + symmetric fan [-28..+16] to {}",
                             ctrl_addr
                         ));
                         if let Ok(sock) = punch_sock.try_clone() {
                             tokio::spawn(async move {
                                 for round in 0..22 {
                                     let _ = sock.send_to(b"OPRM_PUNCH", ctrl_addr);
-                                    // Fan out around predicted sequential Symmetric NAT ports (-4..+12)
-                                    // on the first 10 rounds so Restricted Cone routers accept Controller's QUIC packet
-                                    if round < 10 {
+                                    // Fan out across [-28..+16] around reported NAT port on the first 8 rounds
+                                    // so pooled Symmetric NAT blocks (e.g. 2048..2080) open before QUIC arrives
+                                    if round < 8 {
                                         let base_port = ctrl_addr.port();
-                                        for delta in -4i32..=12i32 {
+                                        for delta in -28i32..=16i32 {
                                             if delta == 0 {
                                                 continue;
                                             }
-                                            let p = (base_port as i32 + delta).clamp(1, 65535) as u16;
-                                            let pred = SocketAddr::new(ctrl_addr.ip(), p);
-                                            let _ = sock.send_to(b"OPRM_PUNCH", pred);
+                                            let p_i32 = base_port as i32 + delta;
+                                            if (1024..=65535).contains(&p_i32) {
+                                                let pred = SocketAddr::new(ctrl_addr.ip(), p_i32 as u16);
+                                                let _ = sock.send_to(b"OPRM_PUNCH", pred);
+                                            }
                                         }
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

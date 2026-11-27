@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const SERVER_VERSION = '2.2.0-p2p';
+const SERVER_VERSION = '2.3.0-quic-relay';
 const HTTP_PORT = parseInt(process.env.PORT || '28844', 10);
 const UDP_PORT = parseInt(process.env.UDP_PORT || '28844', 10);
 const RELAY_PORT = parseInt(process.env.RELAY_PORT || '28845', 10);
@@ -428,6 +428,7 @@ const server = http.createServer(async (req, res) => {
       features: [
         'Account-Auth-HMAC',
         'Authenticated-TCP-Relay',
+        'UDP-QUIC-Relay',
         'Zero-Loss-Packet-Bridge',
         'IPv6-Direct',
         'STUN-Reflective',
@@ -438,6 +439,40 @@ const server = http.createServer(async (req, res) => {
 
   return sendJson(res, 404, { error: 'Endpoint not found' });
 });
+
+// --- UDP QUIC Relay Multiplexer State (Zero Head-of-Line Blocking over UDP 28844 + Host TCP-1ms bridge) ---
+const quicRelaySessions = new Map();
+
+function getQuicRelaySession(code) {
+  let s = quicRelaySessions.get(code);
+  if (!s) {
+    s = {
+      hostTcp: null,
+      hostUdp: null,
+      ctrls: new Map(),
+      ctrlByAddr: new Map(),
+      nextPeerId: 10001,
+    };
+    quicRelaySessions.set(code, s);
+  }
+  return s;
+}
+
+function forwardQuicToHost(session, peerId, payload) {
+  if (!payload || payload.length === 0) return;
+  if (session.hostTcp && !session.hostTcp.destroyed) {
+    const hdr = Buffer.allocUnsafe(6);
+    hdr.writeUInt16BE(4 + payload.length, 0);
+    hdr.writeUInt32BE(peerId, 2);
+    session.hostTcp.write(Buffer.concat([hdr, payload]));
+  } else if (session.hostUdp && Date.now() - session.hostUdp.ts < 35_000) {
+    const hdr = Buffer.allocUnsafe(9);
+    hdr[0] = 0x4f; hdr[1] = 0x52; hdr[2] = 0x4c; hdr[3] = 0x59; // ORLY
+    hdr[4] = 0x05;
+    hdr.writeUInt32BE(peerId, 5);
+    udpSocket.send(Buffer.concat([hdr, payload]), session.hostUdp.port, session.hostUdp.ip);
+  }
+}
 
 // --- TCP Relay Tunneling Server (Port 28845) ---
 function tryBridgeSession(sessionId) {
@@ -535,9 +570,57 @@ const relayServer = net.createServer({ noDelay: true }, (socket) => {
     const line = rawHeaderBuf.subarray(0, newlineIndex).toString('utf8').trim();
     const remainder = Buffer.from(rawHeaderBuf.subarray(newlineIndex + 1));
     rawHeaderBuf = Buffer.alloc(0);
+    const parts = line.split(/\s+/);
+
+    // Dedicated Host QUIC-datagram bridge over local/hairpin TCP 28845 <-> internet UDP 28844
+    if (parts[0] === 'OPRM_QUIC_HOST' && parts.length >= 2) {
+      const code = normalizeCode(parts[1]);
+      const session = getQuicRelaySession(code);
+      if (session.hostTcp && session.hostTcp !== socket && !session.hostTcp.destroyed) {
+        session.hostTcp._replaced = true;
+        session.hostTcp.destroy();
+      }
+      session.hostTcp = socket;
+      let rxBuf = remainder;
+      console.log(`[QUIC-Relay] Host ${code} datagram bridge ready (TCP-1ms <-> UDP)`);
+
+      const pumpFrames = () => {
+        while (rxBuf.length >= 2) {
+          const totalLen = rxBuf.readUInt16BE(0);
+          if (totalLen < 4 || totalLen > 4096) {
+            socket.destroy();
+            return;
+          }
+          if (rxBuf.length < 2 + totalLen) break;
+          const peerId = rxBuf.readUInt32BE(2);
+          const payload = rxBuf.subarray(6, 2 + totalLen);
+          const ctrl = session.ctrls.get(peerId);
+          if (ctrl && Date.now() - ctrl.ts < 60_000) {
+            const out = Buffer.allocUnsafe(5 + payload.length);
+            out[0] = 0x4f; out[1] = 0x52; out[2] = 0x4c; out[3] = 0x59; out[4] = 0x04;
+            payload.copy(out, 5);
+            udpSocket.send(out, ctrl.port, ctrl.ip);
+          }
+          rxBuf = rxBuf.subarray(2 + totalLen);
+        }
+      };
+
+      pumpFrames();
+      socket.on('data', (chunk) => {
+        rxBuf = rxBuf.length > 0 ? Buffer.concat([rxBuf, chunk]) : chunk;
+        pumpFrames();
+      });
+      socket.on('close', () => {
+        if (!socket._replaced && session.hostTcp === socket) {
+          session.hostTcp = null;
+        }
+      });
+      socket.on('error', () => {});
+      socket.resume();
+      return;
+    }
 
     // Protocol: "OPRM_RELAY <sessionId> <HOST|CTRL> [authToken]"
-    const parts = line.split(/\s+/);
     let sessionId = '';
     let role = '';
     let token = '';
@@ -649,6 +732,89 @@ const relayServer = net.createServer({ noDelay: true }, (socket) => {
 const udpSocket = dgram.createSocket('udp4');
 
 udpSocket.on('message', (msg, rinfo) => {
+  // Multiplexed ORLY UDP-QUIC Relay datagrams on existing UDP 28844 port
+  if (msg.length >= 5 && msg[0] === 0x4f && msg[1] === 0x52 && msg[2] === 0x4c && msg[3] === 0x59) {
+    const cmd = msg[4];
+    const now = Date.now();
+    const addrKey = `${rinfo.address}:${rinfo.port}`;
+
+    if (cmd === 0x01 && msg.length >= 14) {
+      const code = normalizeCode(msg.subarray(5, 14).toString('utf8'));
+      const session = getQuicRelaySession(code);
+      session.hostUdp = { ip: rinfo.address, port: rinfo.port, ts: now };
+      udpSocket.send(Buffer.from('ORLY\x00OK'), rinfo.port, rinfo.address);
+      return;
+    }
+
+    if (cmd === 0x02 && msg.length >= 15) {
+      const code = normalizeCode(msg.subarray(5, 14).toString('utf8'));
+      const tokLen = msg[14];
+      const token = msg.length >= 15 + tokLen ? msg.subarray(15, 15 + tokLen).toString('utf8') : '';
+      const authUser = verifyToken(token);
+      if (REQUIRE_RELAY_AUTH && !authUser) {
+        udpSocket.send(Buffer.from('ORLY\x7fAUTH'), rinfo.port, rinfo.address);
+        return;
+      }
+      const session = quicRelaySessions.get(code);
+      const hostAlive =
+        session &&
+        ((session.hostTcp && !session.hostTcp.destroyed) ||
+          (session.hostUdp && now - session.hostUdp.ts < 35_000));
+      if (!hostAlive) {
+        udpSocket.send(Buffer.from('ORLY\x7fNOHOST'), rinfo.port, rinfo.address);
+        return;
+      }
+
+      // Prune stale controller mappings >60s before allocating
+      for (const [pid, c] of session.ctrls.entries()) {
+        if (now - c.ts > 60_000) {
+          session.ctrls.delete(pid);
+          session.ctrlByAddr.delete(`${c.ip}:${c.port}`);
+        }
+      }
+
+      let peerId = session.ctrlByAddr.get(addrKey);
+      if (!peerId) {
+        peerId = session.nextPeerId;
+        session.nextPeerId = session.nextPeerId >= 60000 ? 10001 : session.nextPeerId + 1;
+        session.ctrlByAddr.set(addrKey, peerId);
+      }
+      session.ctrls.set(peerId, { ip: rinfo.address, port: rinfo.port, ts: now });
+      console.log(
+        `[QUIC-Relay] Controller ${addrKey} joined ${code} as peerId=${peerId} (user: ${authUser || 'guest'})`
+      );
+      udpSocket.send(Buffer.from('ORLY\x00OK'), rinfo.port, rinfo.address);
+      return;
+    }
+
+    if (cmd === 0x03 && msg.length > 14) {
+      const code = normalizeCode(msg.subarray(5, 14).toString('utf8'));
+      const session = quicRelaySessions.get(code);
+      if (!session) return;
+      const peerId = session.ctrlByAddr.get(addrKey);
+      if (!peerId) return;
+      const ctrl = session.ctrls.get(peerId);
+      if (ctrl) ctrl.ts = now;
+      forwardQuicToHost(session, peerId, msg.subarray(14));
+      return;
+    }
+
+    if (cmd === 0x05 && msg.length > 18) {
+      const code = normalizeCode(msg.subarray(5, 14).toString('utf8'));
+      const peerId = msg.readUInt32BE(14);
+      const session = quicRelaySessions.get(code);
+      if (!session) return;
+      const ctrl = session.ctrls.get(peerId);
+      if (!ctrl || now - ctrl.ts > 60_000) return;
+      const out = Buffer.allocUnsafe(5 + (msg.length - 18));
+      out[0] = 0x4f; out[1] = 0x52; out[2] = 0x4c; out[3] = 0x59; out[4] = 0x04;
+      msg.copy(out, 5, 18);
+      udpSocket.send(out, ctrl.port, ctrl.ip);
+      return;
+    }
+    return;
+  }
+
   if (msg.toString('utf8').trim() === 'KEEPALIVE') {
     return;
   }
