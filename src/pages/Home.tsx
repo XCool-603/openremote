@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { DeviceCard } from '../components/DeviceCard';
 import { useConnectionStore } from '../stores/connectionStore';
 import { safeInvoke } from '../hooks/useTauri';
-import { PeerDevice, DeviceInfo } from '../types';
+import { PeerDevice, DeviceInfo, HostControlStatus } from '../types';
 import {
   Plus,
   RefreshCw,
@@ -13,6 +13,8 @@ import {
   Radio,
   Search,
   ExternalLink,
+  ShieldAlert,
+  PowerOff,
 } from 'lucide-react';
 
 const SAVED_DEVICES_KEY = 'openremote_saved_devices';
@@ -46,6 +48,8 @@ export const Home: React.FC = () => {
   const [connectAddress, setConnectAddress] = useState('');
   const [copied, setCopied] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [serviceBusy, setServiceBusy] = useState(false);
+  const [hostControl, setHostControl] = useState<HostControlStatus | null>(null);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
 
   const saveDeviceRecord = (address: string, name?: string) => {
@@ -101,6 +105,27 @@ export const Home: React.FC = () => {
     }
     fetchDeviceInfo();
   }, [setDeviceInfo]);
+
+  // Poll incoming remote control status every 1s so the controlled host PC ALWAYS displays live state!
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const st = await safeInvoke<HostControlStatus>('get_host_control_status');
+        if (!cancelled) {
+          setHostControl(st?.active ? st : null);
+        }
+      } catch {
+        // ignore in web preview
+      }
+    };
+    poll();
+    const timer = window.setInterval(poll, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const handleCopyId = () => {
     const code = deviceInfo?.device_code || '739-281-904';
@@ -190,10 +215,45 @@ export const Home: React.FC = () => {
                 </div>
                 <span className="font-bold text-white text-sm">此电脑 (被控端)</span>
               </div>
-              <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                <Radio className="w-3 h-3 animate-pulse" /> 串流引擎在线
-              </span>
+              {hostControl?.active ? (
+                <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 animate-pulse">
+                  <ShieldAlert className="w-3 h-3" /> 正在被远程控制中 ({hostControl.transport_mode})
+                </span>
+              ) : (
+                <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                  <Radio className="w-3 h-3 animate-pulse" /> 串流引擎在线
+                </span>
+              )}
             </div>
+
+            {hostControl?.active && (
+              <div className="mb-3 p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/40 flex items-center justify-between gap-3 text-xs">
+                <div className="min-w-0">
+                  <div className="font-semibold text-emerald-300 truncate">
+                    控制端已接入: {hostControl.controller_id || '远程控制端'}
+                  </div>
+                  <div className="text-[11px] text-emerald-200/80 font-mono mt-0.5 truncate">
+                    通道: {hostControl.transport_mode} · 来源: {hostControl.remote_addr}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await safeInvoke('stop_incoming_control');
+                      setHostControl(null);
+                      setStatusNotice('已主动断开当前远程控制连接');
+                    } catch (err) {
+                      setStatusNotice(`断开失败: ${err}`);
+                    }
+                  }}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 font-semibold whitespace-nowrap shrink-0 transition-colors"
+                >
+                  <PowerOff className="w-3.5 h-3.5" />
+                  <span>断开控制</span>
+                </button>
+              </div>
+            )}
 
             <div className="grid grid-cols-2 gap-4 mt-3">
               <div className="bg-surface-dark/80 p-3.5 rounded-xl border border-surface-lighter/60">
@@ -233,6 +293,111 @@ export const Home: React.FC = () => {
                 <span className="text-zinc-500">双栈中继直连</span>
               )}
             </div>
+
+            {/* Windows LocalSystem Service Control (enables Lock Screen, UAC, pre-login & zero os error 5) */}
+            <div className="mt-3 p-2.5 rounded-xl bg-surface-dark/90 border border-surface-lighter/70 flex items-center justify-between gap-2 text-[11px]">
+              {deviceInfo?.service_running ? (
+                <>
+                  <div className="text-emerald-400 leading-snug">
+                    <span className="font-semibold">✓ SYSTEM 系统服务运行中</span>
+                    <span className="text-zinc-400 ml-1.5">已支持锁屏解锁、UAC 弹窗与开机直连</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      type="button"
+                      disabled={serviceBusy}
+                      onClick={async () => {
+                        setServiceBusy(true);
+                        setStatusNotice('正在更新并重启 SYSTEM 系统服务...');
+                        try {
+                          await safeInvoke('install_system_service');
+                          const refreshed = await safeInvoke<DeviceInfo>('get_device_info');
+                          if (refreshed) setDeviceInfo(refreshed);
+                          setStatusNotice('✓ SYSTEM 系统服务已更新并启动（已同步最新版内核）');
+                        } catch (err) {
+                          setStatusNotice(`更新系统服务失败: ${err}`);
+                        } finally {
+                          setServiceBusy(false);
+                        }
+                      }}
+                      className="px-2 py-1 rounded-lg bg-surface-light hover:bg-surface-lighter border border-surface-lighter text-zinc-300 whitespace-nowrap disabled:opacity-50 transition-colors"
+                    >
+                      {serviceBusy ? '处理中...' : '更新服务'}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={serviceBusy}
+                      onClick={async () => {
+                        setServiceBusy(true);
+                        try {
+                          await safeInvoke('uninstall_system_service');
+                          const refreshed = await safeInvoke<DeviceInfo>('get_device_info');
+                          if (refreshed) setDeviceInfo(refreshed);
+                          setStatusNotice('已停止并卸载 OpenRemote SYSTEM 系统服务');
+                        } catch (err) {
+                          setStatusNotice(`卸载系统服务失败: ${err}`);
+                        } finally {
+                          setServiceBusy(false);
+                        }
+                      }}
+                      className="px-2 py-1 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 whitespace-nowrap disabled:opacity-50 transition-colors"
+                    >
+                      卸载
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="text-zinc-300 leading-snug">
+                    <span className="text-amber-300 font-semibold">未启用 SYSTEM 系统服务</span>
+                    <span className="text-zinc-400 ml-1.5">安装后支持锁屏输密码、UAC 点击与开机免登录直连</span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={serviceBusy}
+                    onClick={async () => {
+                      setServiceBusy(true);
+                      setStatusNotice('正在安装并启动 OpenRemote LocalSystem 系统服务...');
+                      try {
+                        await safeInvoke('install_system_service');
+                        const refreshed = await safeInvoke<DeviceInfo>('get_device_info');
+                        if (refreshed) setDeviceInfo(refreshed);
+                        setStatusNotice('✓ SYSTEM 系统服务已安装并启动！现在锁屏、UAC 和开机未登录均可直接连接控制。');
+                      } catch (err) {
+                        setStatusNotice(`安装 SYSTEM 服务失败: ${err}`);
+                      } finally {
+                        setServiceBusy(false);
+                      }
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg bg-primary hover:bg-primary-dark text-white font-semibold whitespace-nowrap shrink-0 disabled:opacity-50 transition-colors shadow-sm"
+                  >
+                    {serviceBusy ? '安装中...' : '一键安装 SYSTEM 服务'}
+                  </button>
+                </>
+              )}
+            </div>
+
+            {deviceInfo?.is_rdp_session && (
+              <div className="mt-3 p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-between gap-2 text-[11px]">
+                <span className="text-amber-300 leading-snug">
+                  检测到当前处于 Windows 远程桌面 (RDP #{deviceInfo.session_id ?? 0})，关闭或最小化 RDP 会导致黑屏和键鼠失效。
+                </span>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const msg = await safeInvoke<string>('detach_local_rdp');
+                      setStatusNotice(msg);
+                    } catch (err) {
+                      setStatusNotice(`切回本地桌面失败: ${err}`);
+                    }
+                  }}
+                  className="px-2.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-zinc-950 font-semibold whitespace-nowrap shrink-0 transition-colors"
+                >
+                  一键切回本地桌面
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Right Panel: Connect to remote device */}
@@ -342,7 +507,14 @@ export const Home: React.FC = () => {
               macAddress={device.mac_address}
               isCurrentConnection={isConnected && peerAddress === device.address}
               onConnect={handleConnect}
-              onDisconnect={disconnect}
+              onDisconnect={async () => {
+                try {
+                  await safeInvoke('disconnect');
+                } catch (err) {
+                  console.warn('Backend disconnect error:', err);
+                }
+                disconnect();
+              }}
               onWakeUp={handleWakeUp}
             />
           ))}

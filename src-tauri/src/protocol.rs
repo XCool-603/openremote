@@ -110,6 +110,16 @@ pub struct DirtyTile {
     pub data: Vec<u8>,
 }
 
+/// File or folder entry returned by directory browsing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirEntryInfo {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size_bytes: u64,
+    pub modified: String,
+}
+
 /// Core protocol messages exchanged between OpenRemote clients & host
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
@@ -185,6 +195,53 @@ pub enum Message {
         screen_w: u16,
         screen_h: u16,
         tiles: Vec<DirtyTile>,
+        timestamp: i64,
+    },
+    /// Remote host cursor shape update (standard CSS cursor keyword, e.g. "default", "text", "pointer")
+    CursorShape {
+        cursor: String,
+    },
+    /// Request remote host to change display resolution (0x0 = native/restore stream scale)
+    SetResolution {
+        width: u32,
+        height: u32,
+    },
+    /// Host diagnostic/status notice sent back to controller UI
+    HostNotice {
+        level: String,
+        message: String,
+    },
+    /// Request remote host to detach its Windows RDP session back to local Console (`tscon /dest:console`)
+    DetachRdp,
+    /// Trigger native Windows Secure Attention Sequence (Ctrl+Alt+Del) via LocalSystem SendSAS
+    SendSas,
+    /// Request remote host directory listing (empty/None path = user Desktop/Drives root)
+    ListDirReq {
+        request_id: String,
+        path: Option<String>,
+    },
+    /// Directory listing response from remote host
+    ListDirResp {
+        request_id: String,
+        current_path: String,
+        parent_path: Option<String>,
+        entries: Vec<DirEntryInfo>,
+        error: Option<String>,
+    },
+    /// Request remote host to send a file back to the controller
+    PullFileReq {
+        path: String,
+    },
+    /// Hardware-encoded H.264 Annex-B video frame (keyframes include SPS+PPS)
+    VideoFrameH264 {
+        data: Vec<u8>,
+        width: u16,
+        height: u16,
+        is_keyframe: bool,
+        timestamp: i64,
+    },
+    /// Controller acknowledgment of received H.264 frame timestamp for bufferbloat prevention
+    VideoFrameAck {
         timestamp: i64,
     },
 }

@@ -6,6 +6,26 @@ export interface DeviceInfo {
   local_ip: string;
   listen_port: number;
   public_ipv6?: string | null;
+  is_rdp_session?: boolean;
+  session_id?: number;
+  service_installed?: boolean;
+  service_running?: boolean;
+}
+
+export interface SystemServiceStatus {
+  installed: boolean;
+  running: boolean;
+  running_as_system: boolean;
+  binary_path?: string | null;
+}
+
+export interface HostControlStatus {
+  active: boolean;
+  host_pid: number;
+  controller_id: string;
+  transport_mode: string;
+  remote_addr: string;
+  connected_at_ms: number;
 }
 
 export interface AppConfig {

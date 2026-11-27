@@ -11,6 +11,10 @@ import {
   Sliders,
   CheckCircle2,
   Lock,
+  Terminal,
+  RefreshCw,
+  FolderOpen,
+  Trash2,
 } from 'lucide-react';
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -32,6 +36,27 @@ export const Settings: React.FC = () => {
   const [requirePassword, setRequirePassword] = useState(true);
   const [password, setPassword] = useState('******');
   const [autoAcceptTrusted, setAutoAcceptTrusted] = useState(false);
+  const [diagLogPath, setDiagLogPath] = useState('');
+  const [diagLogText, setDiagLogText] = useState('');
+  const [copiedLogs, setCopiedLogs] = useState(false);
+
+  const loadDiagLogs = async () => {
+    try {
+      const res = await safeInvoke<{ path: string; content: string }>('get_diag_logs', {
+        maxLines: 250,
+      });
+      if (res) {
+        setDiagLogPath(res.path);
+        setDiagLogText(res.content || '(暂无诊断日志，建立连接或开启服务后会自动记录)');
+      }
+    } catch {
+      // ignore outside Tauri
+    }
+  };
+
+  useEffect(() => {
+    loadDiagLogs();
+  }, []);
 
   useEffect(() => {
     async function loadConfig() {
@@ -252,6 +277,65 @@ export const Settings: React.FC = () => {
             </button>
           </div>
         </form>
+
+        {/* Live P2P / NAT / Stream Diagnostic Log Viewer */}
+        <div className="bg-surface border border-surface-lighter rounded-2xl p-6 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-surface-lighter/50">
+            <div className="flex items-center gap-2.5 text-white font-semibold text-sm">
+              <Terminal className="w-4 h-4 text-emerald-400" />
+              <span>网络穿透 / 打洞与推流实时诊断日志</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={loadDiagLogs}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-surface-light hover:bg-surface-lighter text-xs text-zinc-200 transition-colors"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>刷新</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  navigator.clipboard.writeText(diagLogText || '');
+                  setCopiedLogs(true);
+                  setTimeout(() => setCopiedLogs(false), 2000);
+                }}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 border border-primary/30 text-xs text-primary-light transition-colors"
+              >
+                {copiedLogs ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copiedLogs ? '已复制' : '复制日志'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => safeInvoke('open_diag_log_dir')}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-surface-light hover:bg-surface-lighter text-xs text-zinc-200 transition-colors"
+              >
+                <FolderOpen className="w-3.5 h-3.5" />
+                <span>打开目录</span>
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  await safeInvoke('clear_diag_logs');
+                  loadDiagLogs();
+                }}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-xs text-rose-300 transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>清空</span>
+              </button>
+            </div>
+          </div>
+          {diagLogPath && (
+            <div className="text-[11px] font-mono text-zinc-500 truncate" title={diagLogPath}>
+              日志文件: {diagLogPath}
+            </div>
+          )}
+          <pre className="bg-surface-dark border border-surface-lighter/80 rounded-xl p-3.5 text-[11px] font-mono text-zinc-300 h-64 overflow-y-auto whitespace-pre-wrap break-all leading-relaxed">
+            {diagLogText}
+          </pre>
+        </div>
       </div>
     </div>
   );

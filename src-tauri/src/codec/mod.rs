@@ -1,3 +1,5 @@
+pub mod h264;
+
 use anyhow::{anyhow, Result};
 use image::codecs::jpeg::JpegEncoder;
 use image::{ColorType, ImageBuffer, ImageReader, Rgba};

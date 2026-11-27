@@ -54,13 +54,43 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Returns default config file path
-    pub fn config_path() -> PathBuf {
-        let base_dir = dirs_or_local();
+    /// Legacy per-user config path (%APPDATA%\openremote\config.json)
+    fn legacy_user_config_path() -> PathBuf {
+        let base_dir = if let Ok(app_data) = std::env::var("APPDATA") {
+            PathBuf::from(app_data)
+        } else if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+            PathBuf::from(home).join(".config")
+        } else {
+            PathBuf::from(".")
+        };
         base_dir.join("openremote").join("config.json")
     }
 
-    /// Load config from disk, or create and save default config if absent
+    /// Shared machine-wide directory (C:\ProgramData\OpenRemote on Windows) so both
+    /// the LocalSystem Windows Service and the interactive user GUI share the exact same
+    /// device_code, password, auth_token, and log file!
+    pub fn shared_data_dir() -> PathBuf {
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(prog_data) = std::env::var("PROGRAMDATA") {
+                let p = PathBuf::from(prog_data).join("OpenRemote");
+                if p.exists() || fs::create_dir_all(&p).is_ok() {
+                    return p;
+                }
+            }
+        }
+        Self::legacy_user_config_path()
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Returns default shared config file path
+    pub fn config_path() -> PathBuf {
+        Self::shared_data_dir().join("config.json")
+    }
+
+    /// Load config from disk (auto-migrates legacy %APPDATA% config into ProgramData on first run)
     pub fn load() -> Result<Self> {
         let path = Self::config_path();
         if path.exists() {
@@ -68,35 +98,49 @@ impl AppConfig {
                 .with_context(|| format!("Failed to read config file from {:?}", path))?;
             let config: AppConfig = serde_json::from_str(&data)
                 .with_context(|| "Failed to parse config JSON")?;
-            Ok(config)
-        } else {
-            let config = Self::default();
-            config.save()?;
-            Ok(config)
+            return Ok(config);
         }
+
+        // Migrate legacy per-user config if present so device code & login persist seamlessly!
+        let legacy = Self::legacy_user_config_path();
+        if legacy != path && legacy.exists() {
+            if let Ok(data) = fs::read_to_string(&legacy) {
+                if let Ok(config) = serde_json::from_str::<AppConfig>(&data) {
+                    let _ = config.save();
+                    return Ok(config);
+                }
+            }
+        }
+
+        let config = Self::default();
+        let _ = config.save();
+        Ok(config)
     }
 
-    /// Save current config to disk
+    /// Save current config to disk (falls back to legacy user path if ProgramData is read-only)
     pub fn save(&self) -> Result<()> {
         let path = Self::config_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory {:?}", parent))?;
-        }
         let serialized = serde_json::to_string_pretty(self)
             .with_context(|| "Failed to serialize config to JSON")?;
-        fs::write(&path, serialized)
-            .with_context(|| format!("Failed to write config file to {:?}", path))?;
-        Ok(())
-    }
-}
 
-fn dirs_or_local() -> PathBuf {
-    if let Ok(app_data) = std::env::var("APPDATA") {
-        PathBuf::from(app_data)
-    } else if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        PathBuf::from(home).join(".config")
-    } else {
-        PathBuf::from(".")
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        match fs::write(&path, &serialized) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let legacy = Self::legacy_user_config_path();
+                if legacy != path {
+                    if let Some(parent) = legacy.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    fs::write(&legacy, &serialized)
+                        .with_context(|| format!("Failed to write config file to {:?} (and {:?}: {})", legacy, path, e))?;
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Failed to write config file to {:?}: {}", path, e))
+                }
+            }
+        }
     }
 }

@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const SERVER_VERSION = '2.1.0-auth';
+const SERVER_VERSION = '2.2.0-p2p';
 const HTTP_PORT = parseInt(process.env.PORT || '28844', 10);
 const UDP_PORT = parseInt(process.env.UDP_PORT || '28844', 10);
 const RELAY_PORT = parseInt(process.env.RELAY_PORT || '28845', 10);

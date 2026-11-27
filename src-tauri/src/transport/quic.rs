@@ -46,10 +46,14 @@ impl QuicServer {
                 .map_err(|e| anyhow!("Failed to create QuicServerConfig: {}", e))?,
         ));
 
-        // Transport config tweaks for fast low-latency streaming
+        // Transport config tuned for 60FPS ultra-low-latency desktop streaming
         let mut transport_config = quinn::TransportConfig::default();
-        transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into().unwrap()));
+        transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(15).try_into().unwrap()));
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
+        transport_config.initial_rtt(std::time::Duration::from_millis(15));
+        transport_config.stream_receive_window((8 * 1024 * 1024u32).into());
+        transport_config.receive_window((16 * 1024 * 1024u32).into());
+        transport_config.send_window(8 * 1024 * 1024);
         server_config.transport_config(Arc::new(transport_config));
 
         let runtime = quinn::default_runtime()
@@ -71,21 +75,35 @@ impl QuicServer {
         })
     }
 
-    /// Accept the next incoming connection and open bi-directional channel
-    pub async fn accept_channel(&self) -> Result<ConnectionChannel> {
-        let incoming = self
-            .endpoint
+    /// Accept the next raw incoming QUIC connection without blocking on its handshake
+    pub async fn accept_incoming(&self) -> Result<quinn::Incoming> {
+        self.endpoint
             .accept()
             .await
-            .ok_or_else(|| anyhow!("QUIC endpoint stopped accepting"))?;
+            .ok_or_else(|| anyhow!("QUIC endpoint stopped accepting"))
+    }
 
-        let connection = incoming.await.context("QUIC handshake failed")?;
-        let (send_stream, recv_stream) = connection
-            .accept_bi()
+    /// Complete QUIC handshake and accept bi-directional stream for a single incoming connection
+    pub async fn finish_incoming(incoming: quinn::Incoming) -> Result<ConnectionChannel> {
+        let connection = tokio::time::timeout(std::time::Duration::from_secs(4), incoming)
             .await
-            .context("Failed to accept bi-directional stream")?;
+            .map_err(|_| anyhow!("QUIC handshake timed out"))?
+            .context("QUIC handshake failed")?;
+        let (send_stream, recv_stream) = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            connection.accept_bi(),
+        )
+        .await
+        .map_err(|_| anyhow!("QUIC accept_bi timed out"))?
+        .context("Failed to accept bi-directional stream")?;
 
-        Ok(ConnectionChannel::new(send_stream, recv_stream))
+        Ok(ConnectionChannel::new(connection, send_stream, recv_stream))
+    }
+
+    /// Accept the next incoming connection and open bi-directional channel (convenience wrapper)
+    pub async fn accept_channel(&self) -> Result<ConnectionChannel> {
+        let incoming = self.accept_incoming().await?;
+        Self::finish_incoming(incoming).await
     }
 }
 
@@ -141,10 +159,27 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
 }
 
 impl QuicClient {
-    /// Create QUIC client endpoint matching the target address family (IPv4 or IPv6)
+    /// Create QUIC client endpoint matching the target address family
+    /// (binds physical LAN IPv4 or active global IPv6 to bypass Clash/Mihomo TUN!)
     pub fn new_for_target(target: &SocketAddr) -> Result<Self> {
-        let bind_addr = if target.is_ipv6() {
+        let bind_addr: SocketAddr = if target.is_ipv6() {
+            if !target.ip().is_loopback() {
+                if let Some(pub_v6) = crate::signaling::detect_public_ipv6()
+                    .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                {
+                    let candidate = SocketAddr::new(pub_v6, 0);
+                    if let Ok(c) = Self::bind_client(candidate) {
+                        return Ok(c);
+                    }
+                }
+            }
             "[::]:0".parse()?
+        } else if !target.ip().is_loopback() {
+            if let Some(lan_ip) = crate::signaling::detect_best_local_ipv4() {
+                SocketAddr::new(std::net::IpAddr::V4(lan_ip), 0)
+            } else {
+                "0.0.0.0:0".parse()?
+            }
         } else {
             "0.0.0.0:0".parse()?
         };
@@ -194,8 +229,12 @@ impl QuicClient {
         ));
 
         let mut transport_config = quinn::TransportConfig::default();
-        transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(10).try_into().unwrap()));
+        transport_config.max_idle_timeout(Some(std::time::Duration::from_secs(15).try_into().unwrap()));
         transport_config.keep_alive_interval(Some(std::time::Duration::from_secs(2)));
+        transport_config.initial_rtt(std::time::Duration::from_millis(15));
+        transport_config.stream_receive_window((8 * 1024 * 1024u32).into());
+        transport_config.receive_window((16 * 1024 * 1024u32).into());
+        transport_config.send_window(8 * 1024 * 1024);
         client_config.transport_config(Arc::new(transport_config));
         endpoint.set_default_client_config(client_config);
         Ok(())
@@ -215,6 +254,6 @@ impl QuicClient {
             .await
             .context("Failed to open bi-directional stream")?;
 
-        Ok(ConnectionChannel::new(send_stream, recv_stream))
+        Ok(ConnectionChannel::new(connection, send_stream, recv_stream))
     }
 }
