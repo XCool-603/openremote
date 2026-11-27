@@ -163,11 +163,11 @@ struct StreamProfile {
 impl StreamProfile {
     fn new(is_relay: bool) -> Arc<Self> {
         Arc::new(Self {
-            // Direct LAN/IPv6/P2P: crisp 1080p @ 60FPS; Relay: balanced 720p @ 30FPS with ABR
-            quality: AtomicU8::new(if is_relay { 52 } else { 72 }),
+            // Direct LAN/IPv6/P2P: crisp 1080p @ 60FPS; UDP-QUIC Relay: smooth 720p @ 45FPS with ABR
+            quality: AtomicU8::new(if is_relay { 56 } else { 72 }),
             quality_backoff: AtomicI8::new(0),
             max_width: AtomicU32::new(if is_relay { 1280 } else { 1920 }),
-            fps: AtomicU8::new(if is_relay { 30 } else { 60 }),
+            fps: AtomicU8::new(if is_relay { 45 } else { 60 }),
             native_w: AtomicU32::new(0),
             native_h: AtomicU32::new(0),
             stream_w: AtomicU32::new(0),
@@ -814,6 +814,7 @@ fn spawn_screen_stream_task(
                                 } else if nv12.would_block {
                                     if let Some(ref cap_err) = nv12.capture_error {
                                         report_cap_err(cap_err, &mut last_cap_err_at);
+                                        capture_profile.need_keyframe.store(true, Ordering::Release);
                                     }
                                     std::thread::sleep(std::time::Duration::from_millis(2));
                                     continue;

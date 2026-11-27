@@ -364,7 +364,7 @@ pub async fn try_upnp_port_mapping(local_ip: &str, port: u16) -> bool {
         "urn:schemas-upnp-org:service:WANPPPConnection:1",
     ];
 
-    let socket = match UdpSocket::bind("0.0.0.0:0") {
+    let socket = match bind_udp_direct(0) {
         Ok(s) => s,
         Err(_) => return false,
     };

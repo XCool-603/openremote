@@ -1061,14 +1061,35 @@ pub async fn connect_to_device(
                     (Some((_, p1)), Some((_, p2))) if p1 != p2
                 );
 
+                // Under Symmetric NAT, pre-bind & cluster 5 extra sockets IMMEDIATELY right next to ctrl_udp
+                // BEFORE signaling Host so all 6 NAT port mappings sit tight (+1..+6) around custom/rfc STUN.
+                let mut extra_racers: Vec<std::net::UdpSocket> = Vec::new();
+                if is_symmetric {
+                    for _ in 0..5 {
+                        if let Ok(extra_udp) = crate::nat::bind_udp_direct(0) {
+                            extra_racers.push(extra_udp);
+                        }
+                    }
+                }
+
                 if let Some((ctrl_ip, ctrl_port)) = stun_res {
                     crate::diag_log(&format!(
-                        "[CtrlPunch] NAT={} | rfc={:?} custom={:?} | punching Host {} @ {} (predicting around {}:{})",
-                        stun_diag.nat_type, stun_diag.rfc_mapped, stun_diag.custom_mapped, dev_code, target_addr, ctrl_ip, ctrl_port
+                        "[CtrlPunch] NAT={} | rfc={:?} custom={:?} | punching Host {} @ {} (clustered={} sockets around {}:{})",
+                        stun_diag.nat_type,
+                        stun_diag.rfc_mapped,
+                        stun_diag.custom_mapped,
+                        dev_code,
+                        target_addr,
+                        1 + extra_racers.len(),
+                        ctrl_ip,
+                        ctrl_port
                     ));
-                    // Open our own NAT pinhole FIRST before signaling Host to punch back
-                    for _ in 0..4 {
+                    // Open our own NAT pinholes FIRST on ctrl_udp + all clustered racers before signaling Host
+                    for _ in 0..3 {
                         let _ = ctrl_udp.send_to(b"OPRM_PUNCH", target_addr);
+                        for extra in &extra_racers {
+                            let _ = extra.send_to(b"OPRM_PUNCH", target_addr);
+                        }
                     }
                     let req_t0 = Instant::now();
                     // If RFC STUN differs from signaling STUN (Symmetric NAT), submit both endpoints so Host opens pinholes for both ranges
@@ -1107,34 +1128,58 @@ pub async fn connect_to_device(
                         req_t0.elapsed().as_millis(),
                         punch_status
                     ));
-                    // Poll ctrl_udp for up to 280ms to detect inbound OPRM_PUNCH / OPRM_PUNCH_ACK from Host
+                    // Poll all clustered sockets for up to 260ms to catch inbound OPRM_PUNCH / OPRM_PUNCH_ACK from Host
                     let _ = ctrl_udp.set_nonblocking(true);
+                    for extra in &extra_racers {
+                        let _ = extra.set_nonblocking(true);
+                    }
                     let wait_t0 = Instant::now();
-                    let mut got_host_reply = false;
+                    let mut verified_idx: Option<usize> = None;
                     let mut recv_buf = [0u8; 256];
-                    while wait_t0.elapsed() < Duration::from_millis(280) {
+                    while wait_t0.elapsed() < Duration::from_millis(260) {
                         while let Ok((n, src)) = ctrl_udp.recv_from(&mut recv_buf) {
                             let msg = String::from_utf8_lossy(&recv_buf[..n.min(32)]);
                             if msg.starts_with("OPRM_PUNCH") {
                                 crate::diag_log(&format!(
-                                    "[CtrlPunch] RECV '{}' from {} in {}ms -> bidirectional pinhole OPEN!",
-                                    msg,
-                                    src,
-                                    wait_t0.elapsed().as_millis()
+                                    "[CtrlPunch] Socket #0 RECV '{}' from {} in {}ms -> bidirectional pinhole OPEN!",
+                                    msg, src, wait_t0.elapsed().as_millis()
                                 ));
-                                got_host_reply = true;
+                                verified_idx = Some(0);
                                 break;
                             }
                         }
-                        if got_host_reply {
+                        if verified_idx.is_some() {
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        for (idx, extra) in extra_racers.iter().enumerate() {
+                            while let Ok((n, src)) = extra.recv_from(&mut recv_buf) {
+                                let msg = String::from_utf8_lossy(&recv_buf[..n.min(32)]);
+                                if msg.starts_with("OPRM_PUNCH") {
+                                    crate::diag_log(&format!(
+                                        "[CtrlPunch] Racer #{} RECV '{}' from {} in {}ms -> bidirectional pinhole OPEN!",
+                                        idx + 1, msg, src, wait_t0.elapsed().as_millis()
+                                    ));
+                                    verified_idx = Some(idx + 1);
+                                    break;
+                                }
+                            }
+                            if verified_idx.is_some() {
+                                break;
+                            }
+                        }
+                        if verified_idx.is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(12)).await;
                     }
                     let _ = ctrl_udp.set_nonblocking(false);
-                    if !got_host_reply {
+                    for extra in &extra_racers {
+                        let _ = extra.set_nonblocking(false);
+                    }
+                    if verified_idx.is_none() {
                         crate::diag_log(&format!(
-                            "[CtrlPunch] No punch reply on ctrl_udp during 280ms wait (target={}); racing QUIC sockets",
+                            "[CtrlPunch] No punch reply across {} sockets during 260ms wait (target={}); racing QUIC sockets",
+                            1 + extra_racers.len(),
                             target_addr
                         ));
                     }
@@ -1145,37 +1190,17 @@ pub async fn connect_to_device(
                     ));
                     for _ in 0..4 {
                         let _ = ctrl_udp.send_to(b"OPRM_PUNCH", target_addr);
+                        for extra in &extra_racers {
+                            let _ = extra.send_to(b"OPRM_PUNCH", target_addr);
+                        }
                     }
                 }
 
                 // Helper that sends punch packets continuously from a socket while racing QUIC handshake
-                let race_socket = |sock: std::net::UdpSocket, extra_delay_ms: u64, racer_id: usize| async move {
+                let race_socket = |sock: std::net::UdpSocket, extra_delay_ms: u64| async move {
                     if extra_delay_ms > 0 {
-                        let _ = sock.set_nonblocking(true);
-                        for _ in 0..3 {
-                            let _ = sock.send_to(b"OPRM_PUNCH", target_addr);
-                        }
-                        let t0 = Instant::now();
-                        let mut buf = [0u8; 256];
-                        let mut hit = false;
-                        while t0.elapsed() < Duration::from_millis(extra_delay_ms) {
-                            while let Ok((n, src)) = sock.recv_from(&mut buf) {
-                                let msg = String::from_utf8_lossy(&buf[..n.min(32)]);
-                                if msg.starts_with("OPRM_PUNCH") {
-                                    crate::diag_log(&format!(
-                                        "[CtrlPunch] Racer #{} RECV '{}' from {} -> pinhole OPEN!",
-                                        racer_id, msg, src
-                                    ));
-                                    hit = true;
-                                    break;
-                                }
-                            }
-                            if hit {
-                                break;
-                            }
-                            tokio::time::sleep(Duration::from_millis(15)).await;
-                        }
-                        let _ = sock.set_nonblocking(false);
+                        let _ = sock.send_to(b"OPRM_PUNCH", target_addr);
+                        tokio::time::sleep(Duration::from_millis(extra_delay_ms)).await;
                     }
                     let punch_clone = sock.try_clone().ok();
                     let punch_bg = punch_clone.map(|ps| {
@@ -1204,16 +1229,10 @@ pub async fn connect_to_device(
                     res
                 };
 
-                // Under Symmetric NAT, race up to 6 staggered sockets (Birthday-Paradox NAT port sampling)
-                // so at least one allocated external port hits Host's paced fan range.
                 let mut p2p_race = tokio::task::JoinSet::new();
-                p2p_race.spawn(race_socket(ctrl_udp, 0, 0));
-                if is_symmetric {
-                    for racer_idx in 1u64..=5 {
-                        if let Ok(extra_udp) = crate::nat::bind_udp_direct(0) {
-                            p2p_race.spawn(race_socket(extra_udp, racer_idx * 70, racer_idx as usize));
-                        }
-                    }
+                p2p_race.spawn(race_socket(ctrl_udp, 0));
+                for (idx, extra_udp) in extra_racers.into_iter().enumerate() {
+                    p2p_race.spawn(race_socket(extra_udp, ((idx + 1) as u64) * 45));
                 }
 
                 let mut last_err = format!("P2P {} failed", target_addr);
@@ -2112,11 +2131,11 @@ pub async fn set_stream_quality(
 
     let (quality, max_width, fps) = match (mode.as_str(), is_relay) {
         ("ultra", false) => (78u8, 0u32, 60u8),
-        ("ultra", true) => (60u8, 1600u32, 30u8),
+        ("ultra", true) => (64u8, 1600u32, 60u8),
         ("speed", false) => (48u8, 1280u32, 60u8),
-        ("speed", true) => (38u8, 960u32, 30u8),
+        ("speed", true) => (42u8, 960u32, 30u8),
         (_, false) => (68u8, 1920u32, 60u8),
-        (_, true) => (50u8, 1280u32, 30u8),
+        (_, true) => (54u8, 1280u32, 45u8),
     };
 
     let channel_opt = state.active_channel.lock().await.clone();
@@ -2159,9 +2178,9 @@ pub async fn request_keyframe(state: State<'_, AppState>) -> Result<(), String> 
         .unwrap_or(false);
     let msg = if is_relay {
         Message::QualityConfig {
-            quality: 50,
+            quality: 54,
             max_width: 1280,
-            fps: 30,
+            fps: 45,
         }
     } else {
         Message::QualityConfig {
