@@ -1422,33 +1422,72 @@ pub fn spawn_host_daemon(
                         }
                     }
                     let targets = crate::signaling::poll_udp_punches(&signal_url_punch, &d_code_punch).await;
-                    for ctrl_addr in targets {
-                        diag_log(&format!(
-                            "[HostPunch] received punch request -> sustained 24x90ms UDP burst + symmetric fan [-32..+48] to {}",
-                            ctrl_addr
-                        ));
-                        if let Ok(sock) = punch_sock.try_clone() {
-                            tokio::spawn(async move {
-                                for round in 0..24 {
-                                    let _ = sock.send_to(b"OPRM_PUNCH", ctrl_addr);
-                                    // Fan out asymmetrically [-32..+48] around reported NAT port on the first 12 rounds
-                                    // because pooled Symmetric NATs allocate consecutive ports upward across peers.
-                                    if round < 12 {
-                                        let base_port = ctrl_addr.port();
-                                        for delta in -32i32..=48i32 {
-                                            if delta == 0 {
-                                                continue;
-                                            }
-                                            let p_i32 = base_port as i32 + delta;
-                                            if (1024..=65535).contains(&p_i32) {
-                                                let pred = SocketAddr::new(ctrl_addr.ip(), p_i32 as u16);
-                                                let _ = sock.send_to(b"OPRM_PUNCH", pred);
+                    if !targets.is_empty() {
+                        // Group & deduplicate target ports per peer IP, prioritized closest-first
+                        // so overlapping symmetric STUN endpoints never emit duplicate 160-pkt floods.
+                        let mut by_ip: std::collections::HashMap<std::net::IpAddr, Vec<u16>> =
+                            std::collections::HashMap::new();
+                        for addr in targets {
+                            by_ip.entry(addr.ip()).or_default().push(addr.port());
+                        }
+                        for (ip, base_ports) in by_ip {
+                            let mut seen = std::collections::HashSet::<u16>::new();
+                            let mut ordered_ports = Vec::<u16>::new();
+                            let mut push_port = |p_i32: i32| {
+                                if (1024..=65535).contains(&p_i32) {
+                                    let p = p_i32 as u16;
+                                    if seen.insert(p) {
+                                        ordered_ports.push(p);
+                                    }
+                                }
+                            };
+                            // Tier 1: exact reported ports first
+                            for &bp in &base_ports {
+                                push_port(bp as i32);
+                            }
+                            // Tier 2: interleaved small offsets [-4..-1, +1..+24] around each base port
+                            for step in 1i32..=24i32 {
+                                for &bp in &base_ports {
+                                    push_port(bp as i32 + step);
+                                    if step <= 4 {
+                                        push_port(bp as i32 - step);
+                                    }
+                                }
+                            }
+                            // Tier 3: wider tail [+25..+44, -20..-5]
+                            for step in 5i32..=44i32 {
+                                for &bp in &base_ports {
+                                    if step >= 25 {
+                                        push_port(bp as i32 + step);
+                                    }
+                                    if step <= 20 {
+                                        push_port(bp as i32 - step);
+                                    }
+                                }
+                            }
+                            let port_count = ordered_ports.len();
+                            diag_log(&format!(
+                                "[HostPunch] received punch request -> peer={} bases={:?} -> 18x110ms paced fan ({} unique ports)",
+                                ip, base_ports, port_count
+                            ));
+                            if let Ok(sock) = punch_sock.try_clone() {
+                                tokio::spawn(async move {
+                                    for round in 0..18 {
+                                        let limit = if round < 10 {
+                                            ordered_ports.len().min(68)
+                                        } else {
+                                            ordered_ports.len().min(base_ports.len() + 20)
+                                        };
+                                        for (idx, &port) in ordered_ports[..limit].iter().enumerate() {
+                                            let _ = sock.send_to(b"OPRM_PUNCH", SocketAddr::new(ip, port));
+                                            if idx % 10 == 9 {
+                                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                                             }
                                         }
+                                        tokio::time::sleep(std::time::Duration::from_millis(110)).await;
                                     }
-                                    tokio::time::sleep(std::time::Duration::from_millis(90)).await;
-                                }
-                            });
+                                });
+                            }
                         }
                     }
                     tick = tick.wrapping_add(1);

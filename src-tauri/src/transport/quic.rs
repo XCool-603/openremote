@@ -1,9 +1,113 @@
 use crate::transport::ConnectionChannel;
 use anyhow::{anyhow, Context, Result};
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::udp::{RecvMeta, Transmit};
+use quinn::{AsyncUdpSocket, ClientConfig, Endpoint, ServerConfig, UdpPoller};
 use rustls::pki_types::{CertificateDer, ServerName};
+use std::collections::HashMap;
+use std::fmt;
+use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context as TaskContext, Poll};
+
+/// Lightweight wrapper around Quinn's platform UDP socket on Host servers:
+/// logs inbound `OPRM_PUNCH` / non-loopback peer packets and immediately echoes
+/// `OPRM_PUNCH_ACK` to the sender's true NAT-mapped address.
+struct PunchLoggingUdpSocket {
+    inner: Arc<dyn AsyncUdpSocket>,
+    reply_sock: Option<std::net::UdpSocket>,
+    last_seen: StdMutex<HashMap<SocketAddr, i64>>,
+}
+
+impl fmt::Debug for PunchLoggingUdpSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PunchLoggingUdpSocket").finish_non_exhaustive()
+    }
+}
+
+impl AsyncUdpSocket for PunchLoggingUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        Arc::clone(&self.inner).create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        self.inner.try_send(transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut TaskContext<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let poll = self.inner.poll_recv(cx, bufs, meta);
+        if let Poll::Ready(Ok(count)) = &poll {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            for i in 0..(*count) {
+                let src = meta[i].addr;
+                if src.ip().is_loopback() {
+                    continue;
+                }
+                let pkt_len = meta[i].len.min(bufs[i].len());
+                let data = &bufs[i][..pkt_len];
+                let is_punch = data == b"OPRM_PUNCH";
+                let is_punch_ack = data == b"OPRM_PUNCH_ACK";
+                if is_punch {
+                    if let Some(ref sock) = self.reply_sock {
+                        let _ = sock.send_to(b"OPRM_PUNCH_ACK", src);
+                    }
+                }
+                if is_punch || is_punch_ack || pkt_len >= 64 {
+                    let should_log = if let Ok(mut map) = self.last_seen.lock() {
+                        if map.len() > 64 {
+                            map.retain(|_, ts| now_ms - *ts < 10_000);
+                        }
+                        let prev = map.get(&src).copied().unwrap_or(0);
+                        if now_ms - prev >= 1500 {
+                            map.insert(src, now_ms);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if should_log {
+                        let kind = if is_punch {
+                            "OPRM_PUNCH (replied ACK)"
+                        } else if is_punch_ack {
+                            "OPRM_PUNCH_ACK"
+                        } else {
+                            "QUIC packet"
+                        };
+                        crate::diag_log(&format!(
+                            "[HostPunch] RECV {} from {} (len={})",
+                            kind, src, pkt_len
+                        ));
+                    }
+                }
+            }
+        }
+        poll
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        self.inner.max_transmit_segments()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        self.inner.max_receive_segments()
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
+}
 
 /// Generate self-signed certificate and private key using rcgen
 pub fn generate_self_signed_cert() -> Result<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)> {
@@ -58,13 +162,26 @@ impl QuicServer {
 
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow!("No tokio runtime found for QUIC server"))?;
-        let endpoint = Endpoint::new(
-            quinn::EndpointConfig::default(),
-            Some(server_config),
-            socket,
-            runtime,
-        )
-        .context("Failed to create QUIC server endpoint from socket")?;
+        let reply_sock = socket.try_clone().ok();
+        let endpoint = match runtime.wrap_udp_socket(socket) {
+            Ok(inner) => {
+                let wrapped = Arc::new(PunchLoggingUdpSocket {
+                    inner,
+                    reply_sock,
+                    last_seen: StdMutex::new(HashMap::new()),
+                });
+                Endpoint::new_with_abstract_socket(
+                    quinn::EndpointConfig::default(),
+                    Some(server_config),
+                    wrapped,
+                    runtime,
+                )
+                .context("Failed to create QUIC server endpoint from wrapped socket")?
+            }
+            Err(e) => {
+                return Err(anyhow!("Failed to wrap UDP socket for QUIC server: {}", e));
+            }
+        };
 
         let listen_addr = endpoint.local_addr()?;
         log::info!("QUIC server listening on {}", listen_addr);

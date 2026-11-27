@@ -1107,8 +1107,37 @@ pub async fn connect_to_device(
                         req_t0.elapsed().as_millis(),
                         punch_status
                     ));
-                    // Wait 280ms so Host's 200ms punch poll picks up our punch request & starts spraying [-32..+48]
-                    tokio::time::sleep(Duration::from_millis(280)).await;
+                    // Poll ctrl_udp for up to 280ms to detect inbound OPRM_PUNCH / OPRM_PUNCH_ACK from Host
+                    let _ = ctrl_udp.set_nonblocking(true);
+                    let wait_t0 = Instant::now();
+                    let mut got_host_reply = false;
+                    let mut recv_buf = [0u8; 256];
+                    while wait_t0.elapsed() < Duration::from_millis(280) {
+                        while let Ok((n, src)) = ctrl_udp.recv_from(&mut recv_buf) {
+                            let msg = String::from_utf8_lossy(&recv_buf[..n.min(32)]);
+                            if msg.starts_with("OPRM_PUNCH") {
+                                crate::diag_log(&format!(
+                                    "[CtrlPunch] RECV '{}' from {} in {}ms -> bidirectional pinhole OPEN!",
+                                    msg,
+                                    src,
+                                    wait_t0.elapsed().as_millis()
+                                ));
+                                got_host_reply = true;
+                                break;
+                            }
+                        }
+                        if got_host_reply {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                    }
+                    let _ = ctrl_udp.set_nonblocking(false);
+                    if !got_host_reply {
+                        crate::diag_log(&format!(
+                            "[CtrlPunch] No punch reply on ctrl_udp during 280ms wait (target={}); racing QUIC sockets",
+                            target_addr
+                        ));
+                    }
                 } else {
                     crate::diag_log(&format!(
                         "[CtrlPunch] STUN failed ({}), unilateral punch to {}",
@@ -1120,12 +1149,33 @@ pub async fn connect_to_device(
                 }
 
                 // Helper that sends punch packets continuously from a socket while racing QUIC handshake
-                let race_socket = |sock: std::net::UdpSocket, extra_delay_ms: u64| async move {
+                let race_socket = |sock: std::net::UdpSocket, extra_delay_ms: u64, racer_id: usize| async move {
                     if extra_delay_ms > 0 {
+                        let _ = sock.set_nonblocking(true);
                         for _ in 0..3 {
                             let _ = sock.send_to(b"OPRM_PUNCH", target_addr);
                         }
-                        tokio::time::sleep(Duration::from_millis(extra_delay_ms)).await;
+                        let t0 = Instant::now();
+                        let mut buf = [0u8; 256];
+                        let mut hit = false;
+                        while t0.elapsed() < Duration::from_millis(extra_delay_ms) {
+                            while let Ok((n, src)) = sock.recv_from(&mut buf) {
+                                let msg = String::from_utf8_lossy(&buf[..n.min(32)]);
+                                if msg.starts_with("OPRM_PUNCH") {
+                                    crate::diag_log(&format!(
+                                        "[CtrlPunch] Racer #{} RECV '{}' from {} -> pinhole OPEN!",
+                                        racer_id, msg, src
+                                    ));
+                                    hit = true;
+                                    break;
+                                }
+                            }
+                            if hit {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                        let _ = sock.set_nonblocking(false);
                     }
                     let punch_clone = sock.try_clone().ok();
                     let punch_bg = punch_clone.map(|ps| {
@@ -1155,13 +1205,13 @@ pub async fn connect_to_device(
                 };
 
                 // Under Symmetric NAT, race up to 4 staggered sockets (Birthday-Paradox NAT port sampling)
-                // so at least one allocated external port hits Host's [-32..+48] spray range.
+                // so at least one allocated external port hits Host's paced fan range.
                 let mut p2p_race = tokio::task::JoinSet::new();
-                p2p_race.spawn(race_socket(ctrl_udp, 0));
+                p2p_race.spawn(race_socket(ctrl_udp, 0, 0));
                 if is_symmetric {
                     for racer_idx in 1u64..=3 {
                         if let Ok(extra_udp) = crate::nat::bind_udp_direct(0) {
-                            p2p_race.spawn(race_socket(extra_udp, racer_idx * 90));
+                            p2p_race.spawn(race_socket(extra_udp, racer_idx * 90, racer_idx as usize));
                         }
                     }
                 }
