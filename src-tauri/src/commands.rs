@@ -1080,18 +1080,18 @@ pub async fn connect_to_device(
                     let req_res = if let Some((rfc_ip, rfc_port)) = extra_rfc {
                         let (r1, _r2) = tokio::join!(
                             tokio::time::timeout(
-                                Duration::from_millis(500),
+                                Duration::from_millis(800),
                                 crate::signaling::request_udp_punch(&sig_url, &dev_code, &ctrl_ip, ctrl_port),
                             ),
                             tokio::time::timeout(
-                                Duration::from_millis(500),
+                                Duration::from_millis(800),
                                 crate::signaling::request_udp_punch(&sig_url, &dev_code, &rfc_ip, rfc_port),
                             )
                         );
                         r1
                     } else {
                         tokio::time::timeout(
-                            Duration::from_millis(500),
+                            Duration::from_millis(800),
                             crate::signaling::request_udp_punch(&sig_url, &dev_code, &ctrl_ip, ctrl_port),
                         )
                         .await
@@ -1099,7 +1099,7 @@ pub async fn connect_to_device(
                     let punch_status = match &req_res {
                         Ok(Ok(())) => "Ok".to_string(),
                         Ok(Err(e)) => format!("Err({})", e),
-                        Err(_) => "Timeout(500ms)".to_string(),
+                        Err(_) => "Timeout(800ms)".to_string(),
                     };
                     crate::diag_log(&format!(
                         "[CtrlPunch] request_udp_punch({}) took {}ms -> {}",
@@ -1204,14 +1204,14 @@ pub async fn connect_to_device(
                     res
                 };
 
-                // Under Symmetric NAT, race up to 4 staggered sockets (Birthday-Paradox NAT port sampling)
+                // Under Symmetric NAT, race up to 6 staggered sockets (Birthday-Paradox NAT port sampling)
                 // so at least one allocated external port hits Host's paced fan range.
                 let mut p2p_race = tokio::task::JoinSet::new();
                 p2p_race.spawn(race_socket(ctrl_udp, 0, 0));
                 if is_symmetric {
-                    for racer_idx in 1u64..=3 {
+                    for racer_idx in 1u64..=5 {
                         if let Ok(extra_udp) = crate::nat::bind_udp_direct(0) {
-                            p2p_race.spawn(race_socket(extra_udp, racer_idx * 90, racer_idx as usize));
+                            p2p_race.spawn(race_socket(extra_udp, racer_idx * 70, racer_idx as usize));
                         }
                     }
                 }

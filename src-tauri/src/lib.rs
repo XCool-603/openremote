@@ -681,32 +681,38 @@ fn spawn_screen_stream_task(
                     };
 
                     if use_h264 {
-                        // Prevent TCP Relay / slow-link bufferbloat without ever freezing capture for seconds:
-                        // when oldest unacked frame exceeds max_inflight_ms, pace captures to ~4 FPS (240ms)
-                        // and step quality down gradually (at most -4 every 300ms).
+                        // Prevent Relay/slow-link bufferbloat without ever choking normal WAN jitter or stalling:
+                        // allow 750ms inflight budget on Relay, reset stale >3.5s unacked markers, and step quality gently.
                         if !force_kf && capture_profile.ack_active.load(Ordering::Acquire) {
                             let oldest_unacked = capture_profile.first_unacked_sent_ms.load(Ordering::Acquire);
                             let now_ms = chrono::Utc::now().timestamp_millis();
-                            let max_inflight_ms = if capture_profile.is_relay { 420 } else { 200 };
+                            let max_inflight_ms = if capture_profile.is_relay { 750 } else { 220 };
                             let inflight_age = if oldest_unacked > 0 { now_ms - oldest_unacked } else { 0 };
-                            if oldest_unacked > 0 && inflight_age > max_inflight_ms {
-                                if last_ack_backoff_at.elapsed() >= std::time::Duration::from_millis(300) {
+                            if oldest_unacked > 0 && inflight_age > 3500 {
+                                // Clear stale unacked timestamp (e.g. after BitBlt/Winlogon desktop pause) so capture never deadlocks
+                                capture_profile.first_unacked_sent_ms.store(0, Ordering::Release);
+                                capture_profile.quality_backoff.store(-8, Ordering::Relaxed);
+                                capture_profile.need_keyframe.store(true, Ordering::Release);
+                            } else if oldest_unacked > 0 && inflight_age > max_inflight_ms {
+                                let floor_b = if capture_profile.is_relay && inflight_age < 1600 { -16 } else { -26 };
+                                if last_ack_backoff_at.elapsed() >= std::time::Duration::from_millis(350) {
                                     let cur_b = capture_profile.quality_backoff.load(Ordering::Relaxed);
-                                    if cur_b > -28 {
-                                        capture_profile.quality_backoff.store((cur_b - 4).max(-28), Ordering::Relaxed);
+                                    if cur_b > floor_b {
+                                        capture_profile.quality_backoff.store((cur_b - 4).max(floor_b), Ordering::Relaxed);
                                     }
                                     last_ack_backoff_at = std::time::Instant::now();
                                 }
-                                if last_congested_probe_at.elapsed() < std::time::Duration::from_millis(240) {
+                                let pause_ms = if capture_profile.is_relay { 120 } else { 200 };
+                                if last_congested_probe_at.elapsed() < std::time::Duration::from_millis(pause_ms) {
                                     stat_ack_pauses += 1;
                                     std::thread::sleep(std::time::Duration::from_millis(15));
                                     continue;
                                 }
                                 last_congested_probe_at = std::time::Instant::now();
-                            } else if inflight_age < 120 && last_backoff_recover.elapsed() >= std::time::Duration::from_millis(1200) {
+                            } else if inflight_age < 260 && last_backoff_recover.elapsed() >= std::time::Duration::from_millis(700) {
                                 let cur_b = capture_profile.quality_backoff.load(Ordering::Relaxed);
                                 if cur_b < 0 {
-                                    capture_profile.quality_backoff.store((cur_b + 2).min(0), Ordering::Relaxed);
+                                    capture_profile.quality_backoff.store((cur_b + 3).min(0), Ordering::Relaxed);
                                 }
                                 last_backoff_recover = std::time::Instant::now();
                             }
@@ -722,7 +728,7 @@ fn spawn_screen_stream_task(
 
                                 if !nv12.nv12.is_empty() {
                                     let bitrate_bps = if capture_profile.is_relay {
-                                        (cur_quality as u32) * 18_000
+                                        (cur_quality as u32) * 22_000
                                     } else {
                                         (cur_quality as u32) * 120_000
                                     };
@@ -1454,7 +1460,16 @@ pub fn spawn_host_daemon(
                                     }
                                 }
                             }
-                            // Tier 3: wider tail [+25..+44, -20..-5]
+                            // Tier 3: if bases are within <=72 ports (e.g. [2058, 2096]), bridge the entire gap continuously
+                            // so pooled Symmetric NAT never lands in an unprobed gap between rfc and custom ports!
+                            if let (Some(&min_p), Some(&max_p)) = (base_ports.iter().min(), base_ports.iter().max()) {
+                                if max_p.saturating_sub(min_p) <= 72 {
+                                    for p in (min_p as i32 - 12)..=(max_p as i32 + 36) {
+                                        push_port(p);
+                                    }
+                                }
+                            }
+                            // Tier 4: wider tail [+25..+44, -20..-5]
                             for step in 5i32..=44i32 {
                                 for &bp in &base_ports {
                                     if step >= 25 {
@@ -1473,10 +1488,10 @@ pub fn spawn_host_daemon(
                             if let Ok(sock) = punch_sock.try_clone() {
                                 tokio::spawn(async move {
                                     for round in 0..18 {
-                                        let limit = if round < 10 {
-                                            ordered_ports.len().min(68)
+                                        let limit = if round < 12 {
+                                            ordered_ports.len().min(115)
                                         } else {
-                                            ordered_ports.len().min(base_ports.len() + 20)
+                                            ordered_ports.len().min(base_ports.len() + 36)
                                         };
                                         for (idx, &port) in ordered_ports[..limit].iter().enumerate() {
                                             let _ = sock.send_to(b"OPRM_PUNCH", SocketAddr::new(ip, port));
