@@ -178,7 +178,9 @@ pub struct StunDiagnostic {
 
 impl StunDiagnostic {
     pub fn best_addr(&self) -> Option<(String, u16)> {
-        self.rfc_mapped.clone().or_else(|| self.custom_mapped.clone())
+        // Prefer custom signaling-server STUN first: when Controller is behind Symmetric NAT,
+        // signaling IP's NAT mapping is closest to the Host WAN mapping (or identical IP).
+        self.custom_mapped.clone().or_else(|| self.rfc_mapped.clone())
     }
 }
 

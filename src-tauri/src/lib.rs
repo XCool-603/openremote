@@ -1376,17 +1376,25 @@ pub fn spawn_host_daemon(
                     let targets = crate::signaling::poll_udp_punches(&signal_url_punch, &d_code_punch).await;
                     for ctrl_addr in targets {
                         diag_log(&format!(
-                            "[HostPunch] received punch request -> sustained 22x100ms UDP burst to {}",
+                            "[HostPunch] received punch request -> sustained 22x100ms UDP burst + symmetric fan [-4..+12] to {}",
                             ctrl_addr
                         ));
                         if let Ok(sock) = punch_sock.try_clone() {
                             tokio::spawn(async move {
                                 for round in 0..22 {
                                     let _ = sock.send_to(b"OPRM_PUNCH", ctrl_addr);
-                                    // Also gently probe +1..+2 if controller is behind sequential symmetric NAT
-                                    if round < 6 {
-                                        let next1 = SocketAddr::new(ctrl_addr.ip(), ctrl_addr.port().saturating_add(1));
-                                        let _ = sock.send_to(b"OPRM_PUNCH", next1);
+                                    // Fan out around predicted sequential Symmetric NAT ports (-4..+12)
+                                    // on the first 10 rounds so Restricted Cone routers accept Controller's QUIC packet
+                                    if round < 10 {
+                                        let base_port = ctrl_addr.port();
+                                        for delta in -4i32..=12i32 {
+                                            if delta == 0 {
+                                                continue;
+                                            }
+                                            let p = (base_port as i32 + delta).clamp(1, 65535) as u16;
+                                            let pred = SocketAddr::new(ctrl_addr.ip(), p);
+                                            let _ = sock.send_to(b"OPRM_PUNCH", pred);
+                                        }
                                     }
                                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 }

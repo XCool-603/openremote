@@ -1048,19 +1048,39 @@ pub async fn connect_to_device(
 
                 if let Some((ctrl_ip, ctrl_port)) = stun_res {
                     crate::diag_log(&format!(
-                        "[CtrlPunch] NAT={} | rfc={:?} custom={:?} | punching Host {} @ {}",
-                        stun_diag.nat_type, stun_diag.rfc_mapped, stun_diag.custom_mapped, dev_code, target_addr
+                        "[CtrlPunch] NAT={} | rfc={:?} custom={:?} | punching Host {} @ {} (predicting around {}:{})",
+                        stun_diag.nat_type, stun_diag.rfc_mapped, stun_diag.custom_mapped, dev_code, target_addr, ctrl_ip, ctrl_port
                     ));
                     // Open our own NAT pinhole FIRST before signaling Host to punch back
                     for _ in 0..4 {
                         let _ = ctrl_udp.send_to(b"OPRM_PUNCH", target_addr);
                     }
                     let req_t0 = Instant::now();
-                    let req_res = tokio::time::timeout(
-                        Duration::from_millis(500),
-                        crate::signaling::request_udp_punch(&sig_url, &dev_code, &ctrl_ip, ctrl_port),
-                    )
-                    .await;
+                    // If RFC STUN differs from signaling STUN (Symmetric NAT), submit both endpoints so Host opens pinholes for both ranges
+                    let extra_rfc = stun_diag
+                        .rfc_mapped
+                        .as_ref()
+                        .filter(|(rip, rport)| *rip != ctrl_ip || *rport != ctrl_port)
+                        .cloned();
+                    let req_res = if let Some((rfc_ip, rfc_port)) = extra_rfc {
+                        let (r1, _r2) = tokio::join!(
+                            tokio::time::timeout(
+                                Duration::from_millis(500),
+                                crate::signaling::request_udp_punch(&sig_url, &dev_code, &ctrl_ip, ctrl_port),
+                            ),
+                            tokio::time::timeout(
+                                Duration::from_millis(500),
+                                crate::signaling::request_udp_punch(&sig_url, &dev_code, &rfc_ip, rfc_port),
+                            )
+                        );
+                        r1
+                    } else {
+                        tokio::time::timeout(
+                            Duration::from_millis(500),
+                            crate::signaling::request_udp_punch(&sig_url, &dev_code, &ctrl_ip, ctrl_port),
+                        )
+                        .await
+                    };
                     let punch_status = match &req_res {
                         Ok(Ok(())) => "Ok".to_string(),
                         Ok(Err(e)) => format!("Err({})", e),
